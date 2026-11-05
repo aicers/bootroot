@@ -261,6 +261,9 @@ allocate_ports() {
 materialise_compose_dir() {
   local dir="$1"
   mkdir -p "$dir/openbao"
+  # bootroot refuses compose overrides beside a compose directory the
+  # group or others can write, which a `002` umask would leave.
+  chmod 0755 "$dir"
   cp "$ROOT_DIR/$COMPOSE_FILE_NAME" "$dir/$COMPOSE_FILE_NAME"
   cp "$ROOT_DIR/openbao/openbao.hcl" "$dir/openbao/openbao.hcl"
   cp "$ROOT_DIR/responder.toml.compose" "$dir/responder.toml.compose"

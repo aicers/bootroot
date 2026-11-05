@@ -5,18 +5,24 @@ use anyhow::{Context, Result};
 
 use crate::cli::args::CleanArgs;
 use crate::commands::compose_file::compose_file_dir;
+use crate::commands::compose_overrides::{self, ComposeOverride};
 use crate::commands::compose_project::{ComposeIdentity, DOCKER_BIN};
 use crate::commands::container_name::BootrootContainer;
 use crate::commands::infra::{run_compose, run_compose_with_exec, run_docker_with_exec};
 use crate::commands::init::{
-    POSTGRES_COMPOSE_DIR, POSTGRES_TLS_COMPOSE_OVERRIDE_DIR, POSTGRES_TLS_COMPOSE_OVERRIDE_NAME,
-    compose_has_postgres, prompt_yes_no,
+    DEFAULT_SECRETS_DIR, POSTGRES_COMPOSE_DIR, compose_has_postgres, prompt_yes_no,
 };
 use crate::i18n::Messages;
 use crate::state::StateFile;
 
-const OPENBAO_AGENT_OVERRIDE: &str = "secrets/openbao/docker-compose.openbao-agent.override.yml";
-const OPENBAO_EXPOSED_OVERRIDE: &str = "secrets/openbao/docker-compose.openbao-exposed.yml";
+/// The overrides `clean` adds to `docker compose down`, in order: the
+/// two that start containers the compose file does not declare or
+/// publish differently, then the `PostgreSQL` TLS override, which joins
+/// only when the compose file declares `postgres`.
+const DOWN_OVERRIDES: [ComposeOverride; 2] = [
+    ComposeOverride::OpenBaoAgent,
+    ComposeOverride::OpenBaoExposed,
+];
 
 /// Docker compose project label inspected on the `OpenBao` container so
 /// volume removal can be scoped to `<project>_openbao-*` and not wipe
@@ -53,7 +59,13 @@ pub(crate) fn run_clean(args: &CleanArgs, messages: &Messages) -> Result<()> {
     let compose_dir = compose_dir.as_path();
 
     let identity = ComposeIdentity::resolve_for_dir(compose_dir, None, messages)?;
-    let down_paths = clean_down_files(&args.compose_file.compose_file, compose_dir, messages)?;
+    let secrets_dir = clean_secrets_dir(&StateFile::default_path(), compose_dir);
+    let down_paths = clean_down_files(
+        &args.compose_file.compose_file,
+        compose_dir,
+        &secrets_dir,
+        messages,
+    )?;
     let down_strs: Vec<String> = down_paths
         .iter()
         .map(|path| path.to_string_lossy().into_owned())
@@ -76,7 +88,13 @@ pub(crate) fn run_clean(args: &CleanArgs, messages: &Messages) -> Result<()> {
 
 /// Returns the compose files `clean` passes to `docker compose down`:
 /// the compose file, then each override `init` or `infra install` wrote
-/// that is present.
+/// that is present in `compose-overrides/` and passes the
+/// [`compose_overrides::read`] checks.
+///
+/// An override that fails them is left off with a warning rather than
+/// stopping the reset: `down -v --remove-orphans` removes its containers
+/// anyway. A file left at its `0.7.0` location is not looked at; it goes
+/// with `secrets/`.
 ///
 /// The `PostgreSQL` TLS override names no image, so Compose rejects the
 /// project when the compose file does not declare `postgres` to merge it
@@ -90,25 +108,55 @@ pub(crate) fn run_clean(args: &CleanArgs, messages: &Messages) -> Result<()> {
 fn clean_down_files(
     compose_file: &Path,
     compose_dir: &Path,
+    secrets_dir: &Path,
     messages: &Messages,
 ) -> Result<Vec<PathBuf>> {
+    let checked = |which: ComposeOverride| match compose_overrides::read(
+        compose_dir,
+        secrets_dir,
+        which,
+        None,
+        messages,
+    ) {
+        Ok(path) => path,
+        Err(err) => {
+            let path = compose_overrides::path(compose_dir, which);
+            // To stderr like the CLI's other warnings: this binary
+            // installs no `tracing` subscriber, so an event would be
+            // dropped.
+            eprintln!(
+                "{}",
+                messages.warning_clean_compose_override_skipped(
+                    &path.display().to_string(),
+                    &format!("{err:#}")
+                )
+            );
+            None
+        }
+    };
     let mut files = vec![compose_file.to_path_buf()];
-    files.extend(
-        [
-            compose_dir.join(OPENBAO_AGENT_OVERRIDE),
-            compose_dir.join(OPENBAO_EXPOSED_OVERRIDE),
-        ]
-        .into_iter()
-        .filter(|path| path.exists()),
-    );
-    let postgres_tls = compose_dir
-        .join("secrets")
-        .join(POSTGRES_TLS_COMPOSE_OVERRIDE_DIR)
-        .join(POSTGRES_TLS_COMPOSE_OVERRIDE_NAME);
-    if postgres_tls.exists() && compose_has_postgres(compose_file, messages)? {
+    files.extend(DOWN_OVERRIDES.into_iter().filter_map(checked));
+    if let Some(postgres_tls) = checked(ComposeOverride::PostgresTls)
+        && compose_has_postgres(compose_file, messages)?
+    {
         files.push(postgres_tls);
     }
     Ok(files)
+}
+
+/// Returns the secrets directory `state.json` records, resolved against
+/// `compose_dir` when relative, or `compose_dir/secrets` without one.
+fn clean_secrets_dir(state_path: &Path, compose_dir: &Path) -> PathBuf {
+    let recorded = state_path
+        .exists()
+        .then(|| StateFile::load(state_path).ok())
+        .flatten()
+        .map(|state| state.secrets_dir().to_path_buf());
+    match recorded {
+        Some(dir) if dir.is_absolute() => dir,
+        Some(dir) => compose_dir.join(dir),
+        None => compose_dir.join(DEFAULT_SECRETS_DIR),
+    }
 }
 
 /// Removes only the `bootroot-openbao` container and its volume.
@@ -221,7 +269,8 @@ pub(crate) fn inspect_label_via_docker(container: &str, label: &str) -> Result<O
 
 /// Removes artifacts created by `infra install` and `init`.
 ///
-/// `secrets/`, `postgres/` and `.env` live in the compose file directory
+/// `secrets/`, `compose-overrides/`, `postgres/` and `.env` live in the
+/// compose file directory
 /// (Docker Compose resolves bind-mount paths relative to the compose
 /// file).  Removing `postgres/` needs no privilege although its key is
 /// owned by the server's uid (999, or the one `BOOTROOT_POSTGRES_USER`
@@ -235,6 +284,7 @@ fn remove_clean_artifacts(
     messages: &Messages,
 ) -> Result<()> {
     remove_path_if_exists(&compose_dir.join("secrets"), messages)?;
+    compose_overrides::remove_all(compose_dir, messages)?;
     remove_path_if_exists(&compose_dir.join(POSTGRES_COMPOSE_DIR), messages)?;
     remove_file_if_exists(state_path, messages)?;
     remove_file_if_exists(&compose_dir.join(".env"), messages)?;
@@ -372,7 +422,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let compose_file = root.path().join("docker-compose.yml");
         assert_eq!(
-            clean_down_files(&compose_file, root.path(), &messages).unwrap(),
+            clean_down_files(
+                &compose_file,
+                root.path(),
+                &root.path().join("secrets"),
+                &messages
+            )
+            .unwrap(),
             vec![compose_file.clone()]
         );
 
@@ -381,7 +437,13 @@ mod tests {
         let postgres_tls = write_postgres_tls_override(root.path());
 
         assert_eq!(
-            clean_down_files(&compose_file, root.path(), &messages).unwrap(),
+            clean_down_files(
+                &compose_file,
+                root.path(),
+                &root.path().join("secrets"),
+                &messages
+            )
+            .unwrap(),
             vec![compose_file, exposed, postgres_tls]
         );
     }
@@ -399,7 +461,13 @@ mod tests {
         write_postgres_tls_override(root.path());
 
         assert_eq!(
-            clean_down_files(&compose_file, root.path(), &messages).unwrap(),
+            clean_down_files(
+                &compose_file,
+                root.path(),
+                &root.path().join("secrets"),
+                &messages
+            )
+            .unwrap(),
             vec![compose_file, exposed]
         );
     }
@@ -413,7 +481,13 @@ mod tests {
         let compose_file = root.path().join("docker-compose.yml");
         write_postgres_tls_override(root.path());
 
-        let err = clean_down_files(&compose_file, root.path(), &messages).unwrap_err();
+        let err = clean_down_files(
+            &compose_file,
+            root.path(),
+            &root.path().join("secrets"),
+            &messages,
+        )
+        .unwrap_err();
         assert!(
             err.to_string()
                 .contains(&compose_file.display().to_string()),
@@ -424,17 +498,78 @@ mod tests {
     const COMPOSE_WITH_POSTGRES: &str = "services:\n  postgres:\n    image: postgres:18.4\n";
 
     fn write_openbao_exposed_override(compose_dir: &Path) -> PathBuf {
-        let exposed = compose_dir.join(OPENBAO_EXPOSED_OVERRIDE);
-        std::fs::create_dir_all(exposed.parent().unwrap()).unwrap();
-        std::fs::write(&exposed, "services: {}").unwrap();
-        exposed
+        compose_overrides::write(
+            compose_dir,
+            ComposeOverride::OpenBaoExposed,
+            "services: {}",
+            &Messages::new("en").unwrap(),
+        )
+        .unwrap()
     }
 
     fn write_postgres_tls_override(compose_dir: &Path) -> PathBuf {
-        let postgres_tls = compose_dir.join("secrets/postgres/docker-compose.postgres-tls.yml");
-        std::fs::create_dir_all(postgres_tls.parent().unwrap()).unwrap();
-        std::fs::write(&postgres_tls, "services: {}").unwrap();
-        postgres_tls
+        compose_overrides::write(
+            compose_dir,
+            ComposeOverride::PostgresTls,
+            "services: {}",
+            &Messages::new("en").unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// An override that fails the reader's checks is left off `down`
+    /// rather than stopping the reset, and the others still join.
+    #[test]
+    fn clean_down_files_skip_an_untrusted_override() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let messages = Messages::new("en").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let compose_file = root.path().join("docker-compose.yml");
+        std::fs::write(&compose_file, COMPOSE_WITH_POSTGRES).unwrap();
+        let exposed = write_openbao_exposed_override(root.path());
+        let postgres_tls = write_postgres_tls_override(root.path());
+        std::fs::set_permissions(&exposed, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        assert_eq!(
+            clean_down_files(
+                &compose_file,
+                root.path(),
+                &root.path().join("secrets"),
+                &messages
+            )
+            .unwrap(),
+            vec![compose_file, postgres_tls]
+        );
+    }
+
+    /// Overrides at their `0.7.0` places below `secrets/` are neither
+    /// passed to `down` nor in the way of the reset, and go with
+    /// `secrets/`; `compose-overrides/` is removed too.
+    #[test]
+    fn clean_ignores_legacy_overrides_and_removes_compose_overrides() {
+        let messages = Messages::new("en").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let compose_file = root.path().join("docker-compose.yml");
+        std::fs::write(&compose_file, COMPOSE_WITH_POSTGRES).unwrap();
+        let secrets = root.path().join("secrets");
+        for which in [
+            ComposeOverride::OpenBaoAgent,
+            ComposeOverride::OpenBaoExposed,
+            ComposeOverride::PostgresTls,
+        ] {
+            let legacy = which.legacy_path(root.path(), &secrets);
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, "services: {}").unwrap();
+        }
+        assert_eq!(
+            clean_down_files(&compose_file, root.path(), &secrets, &messages).unwrap(),
+            vec![compose_file]
+        );
+        write_postgres_tls_override(root.path());
+        remove_clean_artifacts(root.path(), &root.path().join("state.json"), &messages).unwrap();
+        assert!(!secrets.exists());
+        assert!(!compose_overrides::overrides_dir(root.path()).exists());
     }
 
     /// A full clean leaves no private key behind, nor `pg_hba.conf`.

@@ -155,6 +155,7 @@ PYTHON_BIN=""
 RUN_ROOT=""
 WORK_DIR=""
 SECRETS_DIR=""
+AUDIT_OVERRIDE_PATH=""
 INTERNAL_DIR=""
 # The stand-in for the registrar endpoint daemon a rotation signals: the
 # PID of the `sudo` that runs it, recorded so cleanup can stop exactly
@@ -461,11 +462,16 @@ create_run_root() {
   RUN_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/bootroot-registrar-internal-init-XXXXXX")"
   WORK_DIR="$RUN_ROOT/bootroot"
   SECRETS_DIR="$WORK_DIR/secrets"
+  # Where `init` renders the audit override, beside the compose file.
+  AUDIT_OVERRIDE_PATH="$WORK_DIR/compose-overrides/docker-compose.openbao-audit.yml"
   INTERNAL_DIR="$SECRETS_DIR/registrar-internal"
   INIT_SUMMARY_JSON="$RUN_ROOT/init-summary.json"
   OPENBAO_ROOT_TOKEN_FILE="$RUN_ROOT/openbao-root-token"
   OPENBAO_CURL_CONFIG="$RUN_ROOT/openbao-curl.conf"
   mkdir -p "$WORK_DIR/openbao"
+  # The compose directory bootroot refuses to read overrides from when
+  # the group or others can write it, which a `002` umask would leave.
+  chmod 0755 "$WORK_DIR"
   # `docker-compose.deploy.yml` carries no build context, so a directory
   # holding a copy of it plus the two configs it resolves relative to
   # itself is a complete install root.
@@ -902,7 +908,7 @@ assert_infra_up_refuses_an_unmounted_store() {
 # reserve is what retires it.
 assert_the_audit_bind_guard_boundaries() {
   local store="$1" override status
-  override="$WORK_DIR/secrets/openbao/docker-compose.openbao-audit.yml"
+  override="$AUDIT_OVERRIDE_PATH"
 
   instance_compose stop openbao >>"$RUN_LOG" 2>&1 || fail "could not stop OpenBao before testing its guarded bind"
   instance_compose rm -f openbao >>"$RUN_LOG" 2>&1 || fail "could not remove OpenBao before testing its guarded bind"
@@ -948,7 +954,7 @@ assert_the_audit_bind_guard_boundaries() {
 # would refuse every later run in this scenario, `run_init` included,
 # with the stale-override error rather than with its own verdict.
 remove_rendered_audit_override() {
-  sudo_to_log rm -f "$WORK_DIR/secrets/openbao/docker-compose.openbao-audit.yml" || true
+  sudo_to_log rm -f "$AUDIT_OVERRIDE_PATH" || true
 }
 
 # A reinit whose configured reserve has not yet been activated must get
@@ -968,7 +974,7 @@ assert_reinit_defers_a_fresh_filesystem_reserve_to_init() {
   # reinit's pre-wipe `infra up` has no override to read, and its ordinary
   # init pass must render the one for `store` after the wipe.
   remove_rendered_audit_override
-  if [ -e "$WORK_DIR/secrets/openbao/docker-compose.openbao-audit.yml" ]; then
+  if [ -e "$AUDIT_OVERRIDE_PATH" ]; then
     fail "could not remove the audit override before fresh-reserve reinit"
   fi
   write_reserve_agent_config "$config" "$store" 16777216
@@ -992,7 +998,7 @@ assert_reinit_defers_a_fresh_filesystem_reserve_to_init() {
     fail "direct init rendered no phase-two commands; see $direct_log"
   sudo -n rm -rf "$WORK_DIR/audit-store" "$store"
   remove_rendered_audit_override
-  [ ! -e "$WORK_DIR/secrets/openbao/docker-compose.openbao-audit.yml" ] ||
+  [ ! -e "$AUDIT_OVERRIDE_PATH" ] ||
     fail "could not reset the direct-init reserve fixture before reinit"
 
   before_container="$(docker inspect --format '{{.Id}}' "${INSTANCE}-openbao")"
@@ -1016,7 +1022,7 @@ assert_reinit_defers_a_fresh_filesystem_reserve_to_init() {
     fail "reinit did not replace OpenBao before the filesystem outcome; see $log"
   grep -q "provisioned, not activated" "$log" ||
     fail "reinit did not reach init's unactivated-reserve outcome; see $log"
-  [ -f "$WORK_DIR/secrets/openbao/docker-compose.openbao-audit.yml" ] ||
+  [ -f "$AUDIT_OVERRIDE_PATH" ] ||
     fail "ordinary init did not render the audit override after reinit"
   [ -d "$WORK_DIR/audit-store" ] ||
     fail "ordinary init did not render the reserve artifacts after reinit"
@@ -1605,7 +1611,7 @@ assert_the_rendered_steps_migrate_an_existing_store() {
 # operator has on disk at this moment, rather than driving bootroot.
 assert_the_audit_bind_refuses_to_create_its_source_mid_migration() {
   local store="$1" unit="$2" override log status before after
-  override="$WORK_DIR/secrets/openbao/docker-compose.openbao-audit.yml"
+  override="$AUDIT_OVERRIDE_PATH"
   log="$ARTIFACT_DIR/compose-up-mid-migration.log"
 
   # The window itself, restated rather than assumed: a change that
@@ -1696,7 +1702,7 @@ remove_reserve_activation() {
 # created yet.
 assert_an_unprivileged_init_is_refused() {
   local log="$ARTIFACT_DIR/init-unprivileged.log"
-  local override="$WORK_DIR/secrets/openbao/docker-compose.openbao-audit.yml"
+  local override="$AUDIT_OVERRIDE_PATH"
   if run_bootroot init \
     --compose-file "$WORK_DIR/$COMPOSE_FILE_NAME" \
     --secrets-dir "$SECRETS_DIR" \
@@ -2472,7 +2478,7 @@ assert_the_infra_agent_tree_belongs_to_its_sidecars() {
 # later that carries no `auth/approle/login`.
 assert_the_infra_agents_are_generated_for_tls() {
   local addr="https://${INSTANCE}-openbao:8200" agent config
-  local override="$SECRETS_DIR/openbao/docker-compose.openbao-agent.override.yml"
+  local override="$WORK_DIR/compose-overrides/docker-compose.openbao-agent.override.yml"
   [ -f "$override" ] || fail "no infra agent compose override was rendered at $override"
   grep -qF "VAULT_ADDR=${addr}" "$override" ||
     fail "the agent override does not point the sidecars at ${addr}"
@@ -2611,7 +2617,7 @@ assert_the_directory_mode_outcome_is_a_success() {
 # The rendered override is what moved the device, and it is the record
 # `bootroot infra up` reads the bind source back out of.
 assert_the_audit_override_binds_the_store() {
-  local override="$WORK_DIR/secrets/openbao/docker-compose.openbao-audit.yml"
+  local override="$AUDIT_OVERRIDE_PATH"
   [ -f "$override" ] || fail "no audit compose override was rendered at $override"
   grep -q "volumes: !override" "$override" ||
     fail "the audit override does not replace the volumes list"

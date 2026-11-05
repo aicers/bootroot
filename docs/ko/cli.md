@@ -194,17 +194,29 @@ flush하지 않습니다. 이후 EAB 갱신에서 에이전트가 같은 경로�
 두지 않은 파일은 대상에 이미 있는 모드를 그대로 씁니다. 손으로 좁혀 둔 파일은 이후
 모든 쓰기에서도 좁은 채로 남고, 새로 만들 때는 프로세스 umask가 허용하는 값 —
 일반적인 `open(2)`가 `0666`에 umask를 적용해 내놓는 바로 그 값 — 을 받습니다.
-여기에 해당하는 파일은 `state.json`, `ca.json`, `openbao.hcl`, compose 오버라이드,
-`init`이 롤백에서 되돌리는 파일이 전부이며, `umask 077`인 호스트에서는 `0600`으로,
-기본값인 `umask 022`에서는 `0644`로 만들어집니다.
+여기에 해당하는 파일은 `state.json`, `ca.json`, `openbao.hcl`, `init`이 롤백에서
+되돌리는 파일이 전부이며, `umask 077`인 호스트에서는 `0600`으로, 기본값인
+`umask 022`에서는 `0644`로 만들어집니다.
+
+compose 오버라이드는 어느 갈래에도 속하지 않습니다. 이 파일들은 `secrets/` 밖의
+`<compose-dir>/compose-overrides/`에 있으며, umask와 관계없이 언제나 `0755`
+디렉터리 안에 `0644`로, 기록한 계정의 소유로 작성됩니다. 손으로 좁혀 둔 모드는
+유지되지 않습니다. 그 이름에 놓인 심볼릭 링크는 따라가지 않고 파일로 교체됩니다.
+모든 명령은 오버라이드를 `docker compose`에 넘기기 전에 compose 디렉터리가 그룹이나
+다른 사용자가 쓸 수 없는지, 그리고 `compose-overrides/`와 파일이 링크가 아니고
+root, bootroot를 실행하는 계정 또는 compose 디렉터리의 소유자가 소유하며 그룹이나
+다른 사용자가 쓸 수 없는지 확인합니다. 그렇지 않으면 경로를 명시한 오류와 함께
+멈춥니다. [운영][compose-overrides]을 참고하세요.
+
+[compose-overrides]: operations.md#compose-overrides-beside-the-compose-file
 
 `secrets/` 아래의 소유자는 트리를 따릅니다. 다른 계정이 소유한 `secrets/`
 위에서 `infra install`, `init`, `openbao save-unseal-keys`를 root로 실행하면,
 이 명령들이 그 안에 만드는 모든 디렉터리는 `0700`이며 그 디렉터리가 만들어지는
-상위 디렉터리의 소유자를 갖고, 그 안에 기록하는 compose 오버라이드, HTTP-01
-관리 TLS 디렉터리, OpenBao Agent CA 번들, 저장된 OpenBao 언실 키는 놓이는
-디렉터리의 소유자를 갖습니다. 따라서 `secrets/`를 소유한 계정은 다음 `infra up`
-을 기다리지 않고 이 파일들을 읽을 수 있습니다.
+상위 디렉터리의 소유자를 갖고, 그 안에 기록하는 HTTP-01 관리 TLS 디렉터리,
+OpenBao Agent CA 번들, 저장된 OpenBao 언실 키는 놓이는 디렉터리의 소유자를
+갖습니다. 따라서 `secrets/`를 소유한 계정은 다음 `infra up`을 기다리지 않고 이
+파일들을 읽을 수 있습니다.
 
 `.env`는 두 번째 갈래에서 유일한 예외입니다. 이미 있는 파일의 모드를 그대로
 유지하는 것은 같지만, 새로 만들 때는 umask에 맡기지 않고 `0600`으로 만듭니다.
@@ -223,7 +235,7 @@ flush하지 않습니다. 이후 EAB 갱신에서 에이전트가 같은 경로�
 
 - **위치를 옮겨 두었을 수 있는 설정 파일은 링크를 따라 기록합니다.** `.env`,
   `ca.json`과 그 템플릿, `openbao.hcl`, HTTP-01 리스폰더 설정과 템플릿, OpenBao
-  Agent 설정, 생성된 compose 오버라이드, `state.json`, `init` 출력 두 파일은
+  Agent 설정, `state.json`, `init` 출력 두 파일은
   링크를 먼저 해석해 그 대상에 게시하므로 링크는 이전에 가리키던 파일을 그대로
   가리킵니다. 서로를 가리키며 순환하는 링크는 대상이 없으므로 거부됩니다.
   `bootroot-remote bootstrap`이 대상 호스트에 기록하는 `agent.toml`도 여기에
@@ -231,7 +243,7 @@ flush하지 않습니다. 이후 EAB 갱신에서 에이전트가 같은 경로�
   `--agent-config-path`에 놓인 링크는 운영자가 직접 마련한 것입니다. 바로 옆의
   `--eab-file-path`는 자격 증명 경로이므로, 그곳의 링크는 대체됩니다. 다만
   다른 계정이 소유한 `secrets/` 위에서 root로 실행한 `infra install`, `init`,
-  `reinit`, `infra up`(OpenBao 감사 오버라이드와 저장된 언실 키),
+  `reinit`, `infra up`(저장된 언실 키),
   `openbao save-unseal-keys`, `rotate infra-cert`(HTTP-01 관리 인증서)는
   예외입니다. 이 명령들은 그 안에서 거치는 모든 디렉터리와 게시할 생성 파일에
   놓인 심볼릭 링크를 따라가지 않고 거부하며, 해당 경로를 명시한 오류와 함께
@@ -306,7 +318,7 @@ HTTP-01 리스폰더가 함께 구동된다는 전제를 둡니다. 서로 다�
 주소에서 리슨하도록 합니다.
 
 `bootroot init`이 실행된 뒤에는 HTTP-01 admin 바인딩이 무엇이든
-`infra up`이 `init`이 `secrets/responder/` 아래에 생성한 리스폰더 설정
+`infra up`이 `init`이 `compose-overrides/`에 생성한 리스폰더 설정
 오버라이드도 적용합니다. 렌더링된 리스폰더 설정을 마운트하는 것이 바로
 이 오버라이드이므로, `infra up`이 리스폰더를 다시 생성하더라도 해당
 배포의 HMAC이 담긴 설정이 유지됩니다. `init` 실행 전에는 오버라이드가
@@ -314,7 +326,7 @@ HTTP-01 리스폰더가 함께 구동된다는 전제를 둡니다. 서로 다�
 설정에서는 챌린지에는 응답하지만 등록은 `503`으로 거부합니다.
 
 `bootroot init`이 실행된 뒤에는 compose 파일이 `postgres`를 선언하는 한
-`infra up`이 `init`이 `secrets/postgres/docker-compose.postgres-tls.yml`에
+`infra up`이 `init`이 `compose-overrides/docker-compose.postgres-tls.yml`에
 작성한 PostgreSQL TLS 오버라이드도 적용합니다. 이 오버라이드는
 PostgreSQL을 TLS 1.3과 X25519MLKEM768로만 시작하고 인증서와
 `pg_hba.conf`를 마운트합니다. 이것이 없으면 Compose가 PostgreSQL을 TLS
@@ -345,6 +357,12 @@ PostgreSQL을 TLS 1.3과 X25519MLKEM768로만 시작하고 인증서와
   `openbao.hcl` TLS 설정이 누락된 경우
 - 비루프백 OpenBao 바인딩 의도가 저장되어 있으나 compose 오버라이드
   파일이 누락된 경우
+- `infra up`에 필요한 오버라이드가 `0.7.0`까지의 릴리스가 쓰던 `secrets/`
+  아래 위치에만 있는 경우. 오류에 두 경로가 모두 나옵니다
+  ([운영](operations.md#compose-overrides-beside-the-compose-file) 참고)
+- compose 디렉터리, `compose-overrides/` 또는 그 안의 오버라이드가 링크이거나,
+  root, bootroot를 실행하는 계정, compose 디렉터리의 소유자 이외의 계정이
+  소유하거나, 그룹이나 다른 사용자가 쓸 수 있는 경우
 
 ### 예시
 
@@ -424,7 +442,7 @@ bootroot infra up
 - `--stepca-bind <IP>:<port>`: 다중 호스트 배포를 위해 step-ca의 ACME
   디렉터리를 비루프백 주소로 게시합니다(선택). `state.json`에
   `stepca_bind_addr`를 기록하고 compose 오버라이드를
-  `secrets/step-ca/docker-compose.stepca-exposed.yml`에 생성합니다.
+  `compose-overrides/docker-compose.stepca-exposed.yml`에 생성합니다.
   오버라이드는 `infra install` 시점에는 적용되지 **않고**
   `bootroot init`과 `infra up`이 적용합니다. 기본값은
   `127.0.0.1:9000` 그대로입니다. step-ca의 ACME 디렉터리는 항상 TLS를
@@ -700,7 +718,7 @@ IP를 더하고, advertise 주소가 기록되어 있으면 그 IP도 더한 것
 - 컨테이너 상태/헬스 요약
 - 완료 메시지
 - `--openbao-bind` 사용 시:
-  `secrets/openbao/docker-compose.openbao-exposed.yml`
+  `compose-overrides/docker-compose.openbao-exposed.yml`
   compose 오버라이드 파일 및 `state.json`에 바인딩 의도
   기록
 
@@ -1135,7 +1153,7 @@ DB DSN host 처리 규칙:
   `0600`입니다. `infra install --postgres-user`가
   `BOOTROOT_POSTGRES_USER`를 기록했다면 `<uid>:0` 소유입니다
 - 그 인증서와 함께 `<compose-dir>/postgres/pg_hba.conf`(모드 `0644`)와
-  compose 오버라이드 `secrets/postgres/docker-compose.postgres-tls.yml`을
+  compose 오버라이드 `compose-overrides/docker-compose.postgres-tls.yml`을
   매 실행마다 작성합니다. PostgreSQL은 이 파일들로 다시 생성되며(`up -d
   --no-deps --force-recreate postgres`), 이후 TCP 연결은
   X25519MLKEM768을 쓰는 TLS 1.3과 `scram-sha-256` 인증으로만 받습니다
@@ -1144,8 +1162,8 @@ DB DSN host 처리 규칙:
   `state.json` → `infra_certs`에서 제거합니다. 따라서 `rotate infra-cert`와
   `rotate ca-key`는 더 이상 이 인증서를 갱신하거나 그 컨테이너에 시그널을
   보내지 않습니다. 이미 `<compose-dir>/postgres/` 아래에 있는 파일과
-  `secrets/postgres/` 아래의 오버라이드는 `bootroot clean`이 (기본 `secrets/`
-  디렉터리와 함께) 제거할 때까지 디스크에 남습니다
+  `compose-overrides/`의 오버라이드는 `bootroot clean`이 제거할 때까지
+  디스크에 남습니다
 - 다음 단계 안내
 - `--summary-json` 지정 시 자동화용 init 요약 JSON 파일 생성
 
@@ -3131,6 +3149,10 @@ bootroot clean --openbao-only --yes
   요구하기 때문입니다. 그런 호스트는 reinit 전에 root로 `bootroot init`을
   한 번 실행하세요.
   [공용 감사 저장소](operations.md#공용-감사-저장소)를 참고하세요.
+  같은 사전 검사는 `state.json`에 바인드 의도가 기록된 노출 오버라이드를
+  bring-up이 읽을 때처럼 하나씩 읽습니다. 없거나, `0.7.0`까지의 릴리스가 쓰던
+  `secrets/` 아래 위치에만 있거나, 소유자·모드 검사를 통과하지 못하면 아무것도
+  제거하기 전에 reinit을 멈춥니다.
 
 ### 동작
 
@@ -3164,13 +3186,13 @@ bootroot clean --openbao-only --yes
 - OpenBao 런타임/부트스트랩 산출물만 제거합니다:
   `secrets/openbao/unseal-keys.txt`, 생성된 인프라 OpenBao Agent 설정
   트리 `secrets/openbao/{stepca,responder}`,
-  `secrets/openbao/docker-compose.openbao-agent.override.yml`,
+  `compose-overrides/docker-compose.openbao-agent.override.yml`,
   서비스별 만료된 AppRole 자격증명 파일
   (`secrets/services/<svc>/{role_id,secret_id,secret_id.wrapped}`).
 - step-ca 자료 (`secrets/config/ca.json`,
   `secrets/secrets/root_ca_key`, `secrets/secrets/intermediate_ca_key`),
-  `secrets/password.txt`, PostgreSQL 컨테이너/볼륨, `secrets/openbao/`
-  하위의 운영자 작성 compose 오버라이드는 보존됩니다.
+  `secrets/password.txt`, PostgreSQL 컨테이너/볼륨, `compose-overrides/`의
+  `infra install` 노출 오버라이드는 보존됩니다.
 - 서비스 레지스트리/AppRole/정책 항목이 비어 있는 상태로 `state.json`을
   다시 작성합니다 (배포 의도 필드만 유지).
 - `infra up --services openbao` 경로로 OpenBao를 다시 기동하여 기록된

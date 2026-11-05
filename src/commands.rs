@@ -2,6 +2,7 @@ pub(crate) mod audit_store;
 pub(crate) mod ca;
 pub(crate) mod clean;
 pub(crate) mod compose_file;
+pub(crate) mod compose_overrides;
 pub(crate) mod compose_project;
 pub(crate) mod constants;
 pub(crate) mod container_name;

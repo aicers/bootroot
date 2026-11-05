@@ -17,6 +17,7 @@ use crate::commands::clean::{
     inspect_label_via_docker, remove_openbao_container_and_volumes,
 };
 use crate::commands::compose_file::compose_file_dir;
+use crate::commands::compose_overrides::{self, ComposeOverride};
 use crate::commands::compose_project::{
     compose_project_name_override, resolve_compose_project_for_dir,
 };
@@ -26,7 +27,9 @@ use crate::commands::infra::run_infra_up;
 use crate::commands::init::registrar_internal::{
     preflight_endpoint_tables, registrar_endpoint_intent,
 };
-use crate::commands::init::{compose_has_openbao, prompt_yes_no, run_init_locked};
+use crate::commands::init::{
+    compose_has_openbao, compose_has_responder, compose_has_stepca, prompt_yes_no, run_init_locked,
+};
 use crate::commands::openbao_url::{
     OPENBAO_HOST_PORT_ENV, effective_openbao_url, effective_openbao_url_with_env,
 };
@@ -80,10 +83,23 @@ const STEP_CA_INIT_ARTIFACTS: &[&str] = &[
 /// refusal.
 fn preflight_endpoint_and_audit_store(
     compose_file: &Path,
+    default_secrets_dir: &Path,
     agent_config: Option<&Path>,
     state_path: &Path,
     messages: &Messages,
 ) -> Result<()> {
+    let state = if state_path.exists() {
+        Some(StateFile::load(state_path)?)
+    } else {
+        None
+    };
+    let secrets_dir = state.as_ref().map_or_else(
+        || default_secrets_dir.to_path_buf(),
+        |state| state.secrets_dir().to_path_buf(),
+    );
+    if let Some(state) = state.as_ref() {
+        preflight_exposure_overrides(compose_file, &secrets_dir, state, messages)?;
+    }
     let registrar_endpoint = preflight_endpoint_tables(
         registrar_endpoint_intent(state_path)?,
         agent_config,
@@ -92,6 +108,7 @@ fn preflight_endpoint_and_audit_store(
     preflight_audit_store(
         &AuditStoreInitInputs {
             compose_file,
+            secrets_dir: &secrets_dir,
             agent_config,
             state_path,
             endpoint_recorded: registrar_endpoint.is_some(),
@@ -99,6 +116,53 @@ fn preflight_endpoint_and_audit_store(
         },
         messages,
     )
+}
+
+/// Reads, before the wipe, each exposure override whose bind intent
+/// `state` records, as the `infra up` and `init` passes after the wipe
+/// will.
+///
+/// The HTTP-01 admin and step-ca overrides are read only when the
+/// compose file declares their service, the condition those passes
+/// apply. A file that fails the [`compose_overrides::read`] checks, is
+/// missing, or exists only at its `0.7.0` location stops `reinit` here,
+/// with nothing removed.
+///
+/// # Errors
+///
+/// Returns the first refusal among the recorded overrides.
+fn preflight_exposure_overrides(
+    compose_file: &Path,
+    secrets_dir: &Path,
+    state: &StateFile,
+    messages: &Messages,
+) -> Result<()> {
+    let compose_dir = compose_file_dir(compose_file);
+    let required = [
+        (
+            state.openbao_bind_addr.is_some(),
+            ComposeOverride::OpenBaoExposed,
+            messages.error_openbao_override_file_missing(),
+        ),
+        (
+            state.http01_admin_bind_addr.is_some()
+                && compose_has_responder(compose_file, messages).unwrap_or(false),
+            ComposeOverride::Http01Exposed,
+            messages.error_http01_admin_override_file_missing(),
+        ),
+        (
+            state.stepca_bind_addr.is_some()
+                && compose_has_stepca(compose_file, messages).unwrap_or(false),
+            ComposeOverride::StepCaExposed,
+            messages.error_stepca_override_file_missing(),
+        ),
+    ];
+    for (recorded, which, missing) in required {
+        if recorded {
+            compose_overrides::read_required(&compose_dir, secrets_dir, which, missing, messages)?;
+        }
+    }
+    Ok(())
 }
 
 /// Runs the `bootroot reinit` recovery flow.
@@ -189,6 +253,7 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
     //      phase-two instructions after the wipe.
     preflight_endpoint_and_audit_store(
         compose_file,
+        &args.secrets_dir.secrets_dir,
         args.agent_config.as_deref(),
         &state_path,
         messages,
@@ -230,6 +295,7 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
         &mut io::stdout().lock(),
         &snapshot,
         &effective_secrets_dir,
+        &compose_dir,
         &openbao_container,
         messages,
     )
@@ -248,7 +314,10 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
     //    The handle's operations block, so they run on blocking
     //    threads.
     let secrets_tree = SecretsTree::open_shared(&effective_secrets_dir).await?;
-    remove_openbao_runtime_state_blocking(&secrets_tree, messages).await?;
+    //    The `OpenBao` Agent override goes with them, from
+    //    `compose-overrides/`; `init` rewrites it. The exposure
+    //    overrides beside it stay.
+    remove_openbao_runtime_state_blocking(&secrets_tree, &compose_dir, messages).await?;
 
     // 10. Rewrite state.json with intent-only fields before infra up.
     //     Keep the registrar predicate out of this transient state:
@@ -664,19 +733,40 @@ pub(crate) fn effective_secrets_dir(args: &ReinitArgs, snapshot: &DeploymentInte
 }
 
 /// Runs [`remove_openbao_runtime_state`] on a blocking thread, since
-/// every operation through the handle blocks.
+/// every operation through the handle blocks, then removes the `OpenBao`
+/// Agent override from `compose_dir/compose-overrides`.
 async fn remove_openbao_runtime_state_blocking(
     tree: &Arc<SecretsTree>,
+    compose_dir: &Path,
     messages: &Messages,
 ) -> Result<()> {
-    let messages = messages.clone();
-    tree.run(move |tree| remove_openbao_runtime_state(tree, &messages))
-        .await
+    let task_messages = messages.clone();
+    tree.run(move |tree| remove_openbao_runtime_state(tree, &task_messages))
+        .await?;
+    remove_openbao_agent_override_blocking(compose_dir, messages).await
 }
 
-/// Removes only `OpenBao` runtime/bootstrap artifacts.  Explicitly
-/// preserves step-ca CA material, operator-authored compose overrides,
-/// `PostgreSQL` state, and non-credential service config.
+/// Removes the `OpenBao` Agent compose override from
+/// `compose_dir/compose-overrides`, on a blocking thread. The exposure
+/// overrides there are left, as `init` reads them back.
+async fn remove_openbao_agent_override_blocking(
+    compose_dir: &Path,
+    messages: &Messages,
+) -> Result<()> {
+    let compose_dir = compose_dir.to_path_buf();
+    let messages = messages.clone();
+    tokio::task::spawn_blocking(move || {
+        compose_overrides::remove(&compose_dir, ComposeOverride::OpenBaoAgent, &messages)
+    })
+    .await
+    .context("compose override removal task panicked")?
+}
+
+/// Removes only `OpenBao` runtime/bootstrap artifacts below the secrets
+/// directory.  Explicitly preserves step-ca CA material, `PostgreSQL`
+/// state, and non-credential service config. The compose overrides live
+/// in `compose-overrides/` beside the compose file, outside this tree;
+/// see [`remove_openbao_agent_override_blocking`].
 ///
 /// Works below `tree`'s anchor. A rooted handle removes every entry
 /// through its descriptors and follows no name below the anchor; a
@@ -701,8 +791,6 @@ pub(crate) fn remove_openbao_runtime_state(tree: &SecretsTree, messages: &Messag
                 .with_context(|| messages.error_remove_dir_failed(&path.display().to_string()))?;
         }
     }
-    let agent_override = openbao_dir.join("docker-compose.openbao-agent.override.yml");
-    remove_file_if_exists(tree, &agent_override, messages)?;
 
     // 3. Stale per-registration credential files under
     //    secrets/services/<registration_id>/.
@@ -754,8 +842,6 @@ fn remove_openbao_runtime_state_rooted(tree: &SecretsTree, messages: &Messages) 
             }
         }
     }
-    let agent_override = openbao_dir.join("docker-compose.openbao-agent.override.yml");
-    remove_file_if_exists(tree, &agent_override, messages)?;
 
     let services_root = secrets_dir.join("services");
     let services_kind = tree
@@ -1024,6 +1110,7 @@ fn write_reinit_plan<W: Write>(
     out: &mut W,
     snapshot: &DeploymentIntent,
     effective_secrets_dir: &Path,
+    compose_dir: &Path,
     openbao_container: &str,
     messages: &Messages,
 ) -> io::Result<()> {
@@ -1062,7 +1149,11 @@ fn write_reinit_plan<W: Write>(
     writeln!(
         out,
         "{}",
-        messages.reinit_plan_preserved_compose_overrides(&secrets_display)
+        messages.reinit_plan_preserved_compose_overrides(
+            &compose_overrides::overrides_dir(compose_dir)
+                .display()
+                .to_string()
+        )
     )?;
     writeln!(out, "{}", messages.reinit_plan_preserved_intent())?;
 
@@ -1554,13 +1645,137 @@ mod tests {
         assert_eq!(rewritten.infra_certs.len(), 1, "infra_certs must survive");
     }
 
+    /// A compose directory whose `state.json` records all three bind
+    /// intents, and a compose file declaring the responder and step-ca.
+    fn exposure_preflight_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempdir().unwrap();
+        let compose_file = dir.path().join("docker-compose.yml");
+        fs::write(
+            &compose_file,
+            "services:\n  bootroot-http01:\n    image: r\n  step-ca:\n    image: s\n",
+        )
+        .unwrap();
+        let state_path = dir.path().join("state.json");
+        StateFile {
+            secrets_dir: Some(dir.path().join("secrets")),
+            openbao_bind_addr: Some("192.168.1.10:8200".to_string()),
+            http01_admin_bind_addr: Some("192.168.1.10:8080".to_string()),
+            stepca_bind_addr: Some("192.168.1.10:9000".to_string()),
+            ..StateFile::default()
+        }
+        .save(&state_path)
+        .unwrap();
+        (dir, compose_file, state_path)
+    }
+
+    fn write_all_exposure_overrides(compose_dir: &Path) {
+        for which in [
+            ComposeOverride::OpenBaoExposed,
+            ComposeOverride::Http01Exposed,
+            ComposeOverride::StepCaExposed,
+        ] {
+            compose_overrides::write(compose_dir, which, "services: {}\n", &test_messages())
+                .unwrap();
+        }
+    }
+
+    /// The pre-wipe preflight reads each recorded exposure override: all
+    /// three present passes, and a missing, legacy-only or untrusted one
+    /// stops `reinit` with the reader's error before anything is removed.
+    #[test]
+    fn the_preflight_refuses_a_missing_legacy_or_untrusted_exposure_override() {
+        let messages = test_messages();
+        let preflight = |compose_file: &Path, state_path: &Path| {
+            preflight_endpoint_and_audit_store(
+                compose_file,
+                Path::new("secrets"),
+                None,
+                state_path,
+                &messages,
+            )
+        };
+
+        let (dir, compose_file, state_path) = exposure_preflight_fixture();
+        write_all_exposure_overrides(dir.path());
+        preflight(&compose_file, &state_path).expect("all three present");
+
+        // Missing.
+        compose_overrides::remove(dir.path(), ComposeOverride::StepCaExposed, &messages).unwrap();
+        let err = preflight(&compose_file, &state_path).expect_err("missing");
+        assert_eq!(
+            err.to_string(),
+            messages.error_stepca_override_file_missing()
+        );
+
+        // Legacy-only.
+        let legacy =
+            ComposeOverride::StepCaExposed.legacy_path(dir.path(), &dir.path().join("secrets"));
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, "services: {}\n").unwrap();
+        let err = preflight(&compose_file, &state_path).expect_err("legacy-only");
+        assert_eq!(
+            err.to_string(),
+            messages.error_compose_override_legacy_exposure(
+                &compose_overrides::path(dir.path(), ComposeOverride::StepCaExposed)
+                    .display()
+                    .to_string(),
+                &legacy.display().to_string()
+            )
+        );
+
+        // Untrusted: a world-writable file.
+        let (dir, compose_file, state_path) = exposure_preflight_fixture();
+        write_all_exposure_overrides(dir.path());
+        let openbao = compose_overrides::path(dir.path(), ComposeOverride::OpenBaoExposed);
+        fs::set_permissions(&openbao, fs::Permissions::from_mode(0o666)).unwrap();
+        let err = preflight(&compose_file, &state_path).expect_err("untrusted");
+        assert!(
+            err.to_string().contains(&openbao.display().to_string()),
+            "{err}"
+        );
+    }
+
+    /// The `OpenBao` Agent override goes from `compose-overrides/` with
+    /// the runtime state, and the exposure overrides beside it stay for
+    /// the `init` pass to read back.
+    #[tokio::test]
+    async fn reinit_removes_the_agent_override_and_keeps_the_exposure_ones() {
+        let dir = tempdir().unwrap();
+        let messages = test_messages();
+        write_all_exposure_overrides(dir.path());
+        let agent = compose_overrides::write(
+            dir.path(),
+            ComposeOverride::OpenBaoAgent,
+            "services: {}\n",
+            &messages,
+        )
+        .unwrap();
+        remove_openbao_agent_override_blocking(dir.path(), &messages)
+            .await
+            .unwrap();
+        assert!(!agent.exists());
+        for which in [
+            ComposeOverride::OpenBaoExposed,
+            ComposeOverride::Http01Exposed,
+            ComposeOverride::StepCaExposed,
+        ] {
+            assert!(
+                compose_overrides::path(dir.path(), which).exists(),
+                "{which:?}"
+            );
+        }
+        // A second removal, with nothing left to remove, succeeds.
+        remove_openbao_agent_override_blocking(dir.path(), &messages)
+            .await
+            .unwrap();
+    }
+
     /// Seeds the files `remove_openbao_runtime_state` removes under
     /// `root.secrets`.
     fn seed_runtime_state(root: &crate::test_support::SwapRoot) {
         root.write("openbao/unseal-keys.txt", "keys");
         root.write("openbao/stepca/agent.hcl", "x");
         root.write("openbao/responder/agent.hcl", "x");
-        root.write("openbao/docker-compose.openbao-agent.override.yml", "x");
         root.write("services/svc/role_id", "r");
         root.write("services/svc/secret_id", "s");
         root.write("services/svc/notes.toml", "keep");
@@ -1581,7 +1796,6 @@ mod tests {
                 "openbao/unseal-keys.txt",
                 "openbao/stepca",
                 "openbao/responder",
-                "openbao/docker-compose.openbao-agent.override.yml",
                 "services/svc/role_id",
                 "services/svc/secret_id",
             ] {
@@ -1714,30 +1928,11 @@ mod tests {
         fs::write(secrets.join("secrets/root_ca_key"), "root").unwrap();
         fs::write(secrets.join("secrets/intermediate_ca_key"), "int").unwrap();
         fs::write(secrets.join("password.txt"), "secret").unwrap();
-        // Compose override that the operator authored — must survive.
-        fs::create_dir_all(secrets.join("openbao")).unwrap();
-        fs::write(
-            secrets.join("openbao/docker-compose.openbao-exposed.yml"),
-            "services: {}",
-        )
-        .unwrap();
-        // The PostgreSQL TLS override `init` wrote — must survive, and
-        // the `init` reinit runs rewrites it.
-        fs::create_dir_all(secrets.join("postgres")).unwrap();
-        fs::write(
-            secrets.join("postgres/docker-compose.postgres-tls.yml"),
-            "services: {}",
-        )
-        .unwrap();
         // Wipe list.
+        fs::create_dir_all(secrets.join("openbao")).unwrap();
         fs::write(secrets.join("openbao/unseal-keys.txt"), "keys").unwrap();
         fs::create_dir_all(secrets.join("openbao/stepca")).unwrap();
         fs::write(secrets.join("openbao/stepca/agent.hcl"), "x").unwrap();
-        fs::write(
-            secrets.join("openbao/docker-compose.openbao-agent.override.yml"),
-            "x",
-        )
-        .unwrap();
         fs::create_dir_all(secrets.join("services/svc")).unwrap();
         fs::write(secrets.join("services/svc/role_id"), "r").unwrap();
         fs::write(secrets.join("services/svc/secret_id"), "s").unwrap();
@@ -1760,30 +1955,12 @@ mod tests {
             "password.txt must be preserved"
         );
         assert!(
-            secrets
-                .join("openbao/docker-compose.openbao-exposed.yml")
-                .exists(),
-            "operator-authored exposed override must be preserved"
-        );
-        assert!(
-            secrets
-                .join("postgres/docker-compose.postgres-tls.yml")
-                .exists(),
-            "the PostgreSQL TLS override must be preserved"
-        );
-        assert!(
             !secrets.join("openbao/unseal-keys.txt").exists(),
             "unseal-keys.txt must be deleted"
         );
         assert!(
             !secrets.join("openbao/stepca").exists(),
             "openbao-agent stepca config dir must be deleted"
-        );
-        assert!(
-            !secrets
-                .join("openbao/docker-compose.openbao-agent.override.yml")
-                .exists(),
-            "openbao-agent compose override must be deleted"
         );
         assert!(
             !secrets.join("services/svc/role_id").exists(),
@@ -2650,6 +2827,7 @@ mod tests {
                 &mut buf,
                 &DeploymentIntent::default(),
                 Path::new("secrets"),
+                Path::new("."),
                 DEFAULT_OPENBAO_CONTAINER,
                 &messages,
             )
@@ -2673,6 +2851,7 @@ mod tests {
             &mut buf,
             &snapshot,
             Path::new("secrets"),
+            Path::new("."),
             DEFAULT_OPENBAO_CONTAINER,
             &messages,
         )
@@ -2767,6 +2946,7 @@ mod tests {
             &mut buf,
             &snapshot,
             Path::new("secrets-custom"),
+            Path::new("."),
             DEFAULT_OPENBAO_CONTAINER,
             &messages,
         )
@@ -2924,6 +3104,7 @@ mod tests {
         let err = preflight_audit_store(
             &AuditStoreInitInputs {
                 compose_file: &dir.path().join("docker-compose.yml"),
+                secrets_dir: &dir.path().join("secrets"),
                 agent_config: None,
                 state_path: &state_path,
                 endpoint_recorded: registrar_endpoint_intent(&state_path)

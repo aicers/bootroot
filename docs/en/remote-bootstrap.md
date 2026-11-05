@@ -642,7 +642,7 @@ bootroot infra install --stepca-bind 192.168.1.10:9000
 ```
 
 - The flag writes a managed compose override to
-    `secrets/step-ca/docker-compose.stepca-exposed.yml` and records
+    `compose-overrides/docker-compose.stepca-exposed.yml` and records
     `stepca_bind_addr` in `state.json`. Without the flag, the default
     `127.0.0.1:9000` publish is unchanged.
 - `bootroot init` applies the stored override while it configures

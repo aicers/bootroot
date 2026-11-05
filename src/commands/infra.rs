@@ -18,6 +18,7 @@ use bootroot::openbao::OpenBaoClient;
 use bootroot::registrar::internal::INTERNAL_DIR;
 
 use crate::cli::args::{InfraInstallArgs, InfraUpArgs};
+use crate::commands::compose_overrides::{self, ComposeOverride};
 use crate::commands::compose_project::{
     ComposeIdentity, ComposeInvocation, DOCKER_BIN, INSTANCE_NAME_ENV_KEY,
     resolve_recorded_instance_name, validate_instance_name,
@@ -42,13 +43,10 @@ use crate::commands::guardrails::{
     write_http01_exposed_override, write_openbao_exposed_override, write_stepca_exposed_override,
 };
 use crate::commands::init::{
-    ComposeServices, DEFAULT_KV_MOUNT, HTTP01_ADMIN_INFRA_CERT_KEY,
-    HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME,
-    OPENBAO_INFRA_CERT_KEY, OpenBaoAuditDevice, POSTGRES_TLS_COMPOSE_OVERRIDE_DIR,
-    POSTGRES_TLS_COMPOSE_OVERRIDE_NAME, RESPONDER_COMPOSE_OVERRIDE_NAME, RESPONDER_CONFIG_DIR,
-    STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME, compose_has_postgres, compose_has_responder,
-    compose_has_stepca, compose_up_reaches_service, hand_over_openbao_tls_key,
-    hand_over_postgres_tls_key, sync_openbao_audit_device,
+    ComposeServices, DEFAULT_KV_MOUNT, HTTP01_ADMIN_INFRA_CERT_KEY, OPENBAO_INFRA_CERT_KEY,
+    OpenBaoAuditDevice, compose_has_postgres, compose_has_responder, compose_has_stepca,
+    compose_up_reaches_service, hand_over_openbao_tls_key, hand_over_postgres_tls_key,
+    sync_openbao_audit_device,
 };
 use crate::commands::openbao_unseal::{
     prompt_unseal_keys_interactive, read_unseal_keys_from_file, read_unseal_keys_in,
@@ -374,7 +372,7 @@ pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Res
     let has_responder =
         compose_has_responder(&args.compose_file.compose_file, messages).unwrap_or(false);
     let responder_config_override = if has_responder {
-        resolve_responder_compose_override(&state_path, compose_dir)?
+        resolve_responder_compose_override(&state_path, compose_dir, messages)?
     } else {
         None
     };
@@ -801,10 +799,6 @@ fn run_infra_install_locked(
         }
     }
     println!("{}", messages.infra_install_dirs_created());
-    // The handle the bind-intent clears below remove their overrides
-    // through: as root over a `secrets/` another account owns, no name
-    // there is followed.
-    let secrets_tree = SecretsTree::open(&secrets_dir)?;
 
     // Resolve the host-side published ports once: the preflight binds
     // them, the `.env` upsert and the compose subprocess environment
@@ -834,13 +828,7 @@ fn run_infra_install_locked(
         )?;
         println!("{}", messages.info_openbao_bind_intent_recorded(bind_addr));
     } else {
-        clear_openbao_bind_intent(
-            state_lock,
-            compose_dir,
-            &secrets_tree,
-            &openbao_url,
-            messages,
-        )?;
+        clear_openbao_bind_intent(state_lock, compose_dir, &openbao_url, messages)?;
     }
 
     if let Some(ref bind_addr) = http01_admin_bind {
@@ -858,7 +846,7 @@ fn run_infra_install_locked(
             messages.info_http01_admin_bind_intent_recorded(bind_addr)
         );
     } else {
-        clear_http01_admin_bind_intent(state_lock, compose_dir, &secrets_tree, messages)?;
+        clear_http01_admin_bind_intent(state_lock, compose_dir, messages)?;
     }
 
     if let Some(ref bind_addr) = stepca_bind {
@@ -872,7 +860,7 @@ fn run_infra_install_locked(
         )?;
         println!("{}", messages.info_stepca_bind_intent_recorded(bind_addr));
     } else {
-        clear_stepca_bind_intent(state_lock, compose_dir, &secrets_tree, messages)?;
+        clear_stepca_bind_intent(state_lock, compose_dir, messages)?;
     }
 
     // Recorded, never cleared: without the flags the predicate `init`
@@ -1866,6 +1854,18 @@ async fn maybe_interactive_unseal(
     wait_for_openbao_active(&client, messages).await
 }
 
+/// Returns the secrets directory `state` records, resolved against
+/// `compose_dir` when relative: the directory an override read by
+/// `infra up` must not sit inside.
+fn state_secrets_dir(state: &StateFile, compose_dir: &Path) -> PathBuf {
+    let secrets_dir = state.secrets_dir();
+    if secrets_dir.is_absolute() {
+        secrets_dir.to_path_buf()
+    } else {
+        compose_dir.join(secrets_dir)
+    }
+}
+
 /// Returns the `OpenBao` exposed compose override path when a
 /// non-loopback bind intent is stored in `StateFile`.
 ///
@@ -1882,15 +1882,15 @@ fn find_openbao_exposed_override(
     }
     let state = StateFile::load(state_path).ok()?;
     state.openbao_bind_addr.as_ref()?;
-    let override_path = compose_dir
-        .join("secrets")
-        .join("openbao")
-        .join(OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME);
-    if override_path.exists() {
-        Some(override_path)
-    } else {
-        None
-    }
+    compose_overrides::read(
+        compose_dir,
+        &state_secrets_dir(&state, compose_dir),
+        ComposeOverride::OpenBaoExposed,
+        None,
+        &crate::i18n::test_messages(),
+    )
+    .ok()
+    .flatten()
 }
 
 /// Resolves the `OpenBao` exposed compose override path if a
@@ -1904,7 +1904,9 @@ fn find_openbao_exposed_override(
 /// # Errors
 ///
 /// Returns a hard error when:
-/// - The stored intent exists but the override file is missing.
+/// - The stored intent exists but the override file is missing, exists
+///   only at its `0.7.0` location, or fails the
+///   [`compose_overrides::read`] checks.
 /// - The override file contains non-`OpenBao` non-loopback bindings.
 /// - TLS prerequisites are not met.
 pub(crate) fn resolve_openbao_exposed_override(
@@ -1919,13 +1921,13 @@ pub(crate) fn resolve_openbao_exposed_override(
     let Some(bind_addr) = state.openbao_bind_addr.as_deref() else {
         return Ok(None);
     };
-    let override_path = compose_dir
-        .join("secrets")
-        .join("openbao")
-        .join(OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME);
-    if !override_path.exists() {
-        anyhow::bail!(messages.error_openbao_override_file_missing());
-    }
+    let override_path = compose_overrides::read_required(
+        compose_dir,
+        &state_secrets_dir(&state, compose_dir),
+        ComposeOverride::OpenBaoExposed,
+        messages.error_openbao_override_file_missing(),
+        messages,
+    )?;
     validate_openbao_override_scope(&override_path, messages)?;
     validate_openbao_override_binding(&override_path, bind_addr, messages)?;
     validate_openbao_tls(compose_dir, state.secrets_dir(), messages)?;
@@ -1937,8 +1939,9 @@ pub(crate) fn resolve_openbao_exposed_override(
 ///
 /// Validates TLS before returning the override path.  Returns `None`
 /// when no non-loopback intent is stored.  Returns a hard error when
-/// the stored intent exists but the override file is missing or TLS
-/// prerequisites are not met.
+/// the stored intent exists but the override file is missing, exists
+/// only at its `0.7.0` location, fails the [`compose_overrides::read`]
+/// checks, or TLS prerequisites are not met.
 pub(crate) fn resolve_http01_exposed_override(
     state_path: &Path,
     compose_dir: &Path,
@@ -1951,22 +1954,16 @@ pub(crate) fn resolve_http01_exposed_override(
     let Some(bind_addr) = state.http01_admin_bind_addr.as_deref() else {
         return Ok(None);
     };
-    let override_path = compose_dir
-        .join("secrets")
-        .join("responder")
-        .join(HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME);
-    if !override_path.exists() {
-        anyhow::bail!(messages.error_http01_admin_override_file_missing());
-    }
+    let override_path = compose_overrides::read_required(
+        compose_dir,
+        &state_secrets_dir(&state, compose_dir),
+        ComposeOverride::Http01Exposed,
+        messages.error_http01_admin_override_file_missing(),
+        messages,
+    )?;
     validate_http01_override_scope(&override_path, messages)?;
     validate_http01_override_binding(&override_path, bind_addr, messages)?;
-    let secrets_dir = state.secrets_dir();
-    let secrets_base = if secrets_dir.is_relative() {
-        compose_dir.join(secrets_dir)
-    } else {
-        secrets_dir.to_path_buf()
-    };
-    validate_http01_admin_tls(&secrets_base, messages)?;
+    validate_http01_admin_tls(&state_secrets_dir(&state, compose_dir), messages)?;
     Ok(Some(override_path))
 }
 
@@ -1975,10 +1972,11 @@ pub(crate) fn resolve_http01_exposed_override(
 ///
 /// Returns `None` when no non-loopback intent is stored.  Returns a
 /// hard error when the stored intent exists but the override file is
-/// missing or its content does not match the stored intent.  Unlike
-/// the `OpenBao` / HTTP-01 admin overrides there is no TLS gate —
-/// step-ca's ACME directory always terminates TLS with the step-ca
-/// certificate.
+/// missing, exists only at its `0.7.0` location, fails the
+/// [`compose_overrides::read`] checks, or its content does not match
+/// the stored intent.  Unlike the `OpenBao` / HTTP-01 admin overrides
+/// there is no TLS gate — step-ca's ACME directory always terminates
+/// TLS with the step-ca certificate.
 pub(crate) fn resolve_stepca_exposed_override(
     state_path: &Path,
     compose_dir: &Path,
@@ -1991,13 +1989,13 @@ pub(crate) fn resolve_stepca_exposed_override(
     let Some(bind_addr) = state.stepca_bind_addr.as_deref() else {
         return Ok(None);
     };
-    let override_path = compose_dir
-        .join("secrets")
-        .join("step-ca")
-        .join(STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME);
-    if !override_path.exists() {
-        anyhow::bail!(messages.error_stepca_override_file_missing());
-    }
+    let override_path = compose_overrides::read_required(
+        compose_dir,
+        &state_secrets_dir(&state, compose_dir),
+        ComposeOverride::StepCaExposed,
+        messages.error_stepca_override_file_missing(),
+        messages,
+    )?;
     validate_stepca_override_scope(&override_path, messages)?;
     validate_stepca_override_binding(&override_path, bind_addr, messages)?;
     Ok(Some(override_path))
@@ -2005,50 +2003,49 @@ pub(crate) fn resolve_stepca_exposed_override(
 
 /// Resolves the responder compose config override `bootroot init` wrote.
 ///
-/// Returns the path whenever the override is present under the recorded
-/// secrets directory, whatever the HTTP-01 admin bind is, so that an
-/// `infra up` that recreates the responder keeps the rendered config —
-/// the one carrying the deployment's HMAC — mounted, along with the
-/// certificate directory when HTTP-01 admin TLS is on. Without it the
-/// container falls back to the bundle's placeholder config.
+/// Returns the path whenever the override is present in
+/// `compose-overrides/` and passes the [`compose_overrides::read`]
+/// checks, whatever the HTTP-01 admin bind is, so that an `infra up`
+/// that recreates the responder keeps the rendered config — the one
+/// carrying the deployment's HMAC — mounted, along with the certificate
+/// directory when HTTP-01 admin TLS is on. Without it the container
+/// falls back to the bundle's placeholder config. The caller has
+/// established that the compose file declares the responder.
 ///
 /// Returns `None` when there is no state file or the override file does
-/// not exist, which is the case before `bootroot init` has run.
+/// not exist, which is the case before `bootroot init` has run. An
+/// override that exists only at its `0.7.0` location stops `infra up`.
 fn resolve_responder_compose_override(
     state_path: &Path,
     compose_dir: &Path,
+    messages: &Messages,
 ) -> Result<Option<std::path::PathBuf>> {
     if !state_path.exists() {
         return Ok(None);
     }
     let state = StateFile::load(state_path)?;
-    // Derive the override path from the persisted secrets_dir so that
-    // non-default --secrets-dir installs are resolved correctly.
-    let secrets_dir = state.secrets_dir();
-    let secrets_base = if secrets_dir.is_relative() {
-        compose_dir.join(secrets_dir)
-    } else {
-        secrets_dir.to_path_buf()
-    };
-    let override_path = secrets_base
-        .join(RESPONDER_CONFIG_DIR)
-        .join(RESPONDER_COMPOSE_OVERRIDE_NAME);
-    if override_path.exists() {
-        Ok(Some(override_path))
-    } else {
-        Ok(None)
-    }
+    let secrets_dir = state_secrets_dir(&state, compose_dir);
+    let legacy = ComposeOverride::Responder.legacy_path(compose_dir, &secrets_dir);
+    compose_overrides::read(
+        compose_dir,
+        &secrets_dir,
+        ComposeOverride::Responder,
+        Some(&legacy),
+        messages,
+    )
 }
 
 /// Resolves the `PostgreSQL` TLS compose override `bootroot init` wrote.
 ///
-/// Returns the path whenever the override is present under the recorded
-/// secrets directory and the compose file declares `postgres`, so that
-/// an `infra up` that recreates `PostgreSQL` keeps its TLS settings.
+/// Returns the path whenever the override is present in
+/// `compose-overrides/`, passes the [`compose_overrides::read`] checks
+/// and the compose file declares `postgres`, so that an `infra up` that
+/// recreates `PostgreSQL` keeps its TLS settings.
 ///
 /// Returns `None` when there is no state file, the compose file does not
 /// declare `postgres`, or the override does not exist, which is the case
-/// before `bootroot init` has run.
+/// before `bootroot init` has run. An override that exists only at its
+/// `0.7.0` location stops `infra up`.
 fn resolve_postgres_tls_override(
     state_path: &Path,
     compose_dir: &Path,
@@ -2059,16 +2056,15 @@ fn resolve_postgres_tls_override(
         return Ok(None);
     }
     let state = StateFile::load(state_path)?;
-    let secrets_dir = state.secrets_dir();
-    let secrets_base = if secrets_dir.is_relative() {
-        compose_dir.join(secrets_dir)
-    } else {
-        secrets_dir.to_path_buf()
-    };
-    let override_path = secrets_base
-        .join(POSTGRES_TLS_COMPOSE_OVERRIDE_DIR)
-        .join(POSTGRES_TLS_COMPOSE_OVERRIDE_NAME);
-    Ok(override_path.exists().then_some(override_path))
+    let secrets_dir = state_secrets_dir(&state, compose_dir);
+    let legacy = ComposeOverride::PostgresTls.legacy_path(compose_dir, &secrets_dir);
+    compose_overrides::read(
+        compose_dir,
+        &secrets_dir,
+        ComposeOverride::PostgresTls,
+        Some(&legacy),
+        messages,
+    )
 }
 
 /// Derives the effective `OpenBao` URL from a stored non-loopback bind
@@ -2200,54 +2196,21 @@ fn save_openbao_bind_intent_to(
 fn clear_openbao_bind_intent(
     _state_lock: &StateLock,
     compose_dir: &Path,
-    secrets_tree: &SecretsTree,
     openbao_url: &str,
     messages: &Messages,
 ) -> Result<()> {
     clear_openbao_bind_intent_to(
         &StateFile::default_path(),
         compose_dir,
-        secrets_tree,
         openbao_url,
         messages,
     )
 }
 
-/// Removes the exposure override at `override_path`, below
-/// `secrets_tree`'s anchor `compose_dir/secrets`, when one is there.
-///
-/// A rooted handle unlinks it through the walked parent's descriptor and
-/// takes `NotFound` as nothing to remove; a path-based one probes and
-/// removes it by path, as it always did.
-fn remove_exposure_override(
-    secrets_tree: &SecretsTree,
-    override_path: &Path,
-    messages: &Messages,
-) -> Result<()> {
-    if secrets_tree.is_rooted() {
-        return match secrets_tree.remove_file(override_path) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(anyhow::Error::new(err)
-                .context(messages.error_remove_file_failed(&override_path.display().to_string()))),
-        };
-    }
-    if override_path.exists() {
-        std::fs::remove_file(override_path).with_context(|| {
-            messages.error_remove_file_failed(&override_path.display().to_string())
-        })?;
-    }
-    Ok(())
-}
-
 /// Inner implementation that accepts explicit paths for testability.
-///
-/// `secrets_tree` is the handle on `compose_dir/secrets` the override is
-/// removed through.
 fn clear_openbao_bind_intent_to(
     state_path: &Path,
     compose_dir: &Path,
-    secrets_tree: &SecretsTree,
     openbao_url: &str,
     messages: &Messages,
 ) -> Result<()> {
@@ -2273,11 +2236,7 @@ fn clear_openbao_bind_intent_to(
     state
         .save(state_path)
         .with_context(|| messages.error_serialize_state_failed())?;
-    let override_path = compose_dir
-        .join("secrets")
-        .join("openbao")
-        .join(OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME);
-    remove_exposure_override(secrets_tree, &override_path, messages)?;
+    compose_overrides::remove(compose_dir, ComposeOverride::OpenBaoExposed, messages)?;
     // Restore openbao.hcl to plaintext so OpenBao does not try to
     // load TLS certificates that are no longer issued or renewed.
     crate::commands::init::write_openbao_hcl_plaintext(compose_dir, messages)?;
@@ -2366,21 +2325,14 @@ fn save_http01_admin_bind_intent_to(
 fn clear_http01_admin_bind_intent(
     _state_lock: &StateLock,
     compose_dir: &Path,
-    secrets_tree: &SecretsTree,
     messages: &Messages,
 ) -> Result<()> {
-    clear_http01_admin_bind_intent_to(
-        &StateFile::default_path(),
-        compose_dir,
-        secrets_tree,
-        messages,
-    )
+    clear_http01_admin_bind_intent_to(&StateFile::default_path(), compose_dir, messages)
 }
 
 fn clear_http01_admin_bind_intent_to(
     state_path: &Path,
     compose_dir: &Path,
-    secrets_tree: &SecretsTree,
     messages: &Messages,
 ) -> Result<()> {
     if !state_path.exists() {
@@ -2396,11 +2348,7 @@ fn clear_http01_admin_bind_intent_to(
     state
         .save(state_path)
         .with_context(|| messages.error_serialize_state_failed())?;
-    let override_path = compose_dir
-        .join("secrets")
-        .join("responder")
-        .join(HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME);
-    remove_exposure_override(secrets_tree, &override_path, messages)?;
+    compose_overrides::remove(compose_dir, ComposeOverride::Http01Exposed, messages)?;
     println!("{}", messages.info_http01_admin_bind_intent_cleared());
     Ok(())
 }
@@ -2510,21 +2458,14 @@ fn sync_state_openbao_url_to(
 fn clear_stepca_bind_intent(
     _state_lock: &StateLock,
     compose_dir: &Path,
-    secrets_tree: &SecretsTree,
     messages: &Messages,
 ) -> Result<()> {
-    clear_stepca_bind_intent_to(
-        &StateFile::default_path(),
-        compose_dir,
-        secrets_tree,
-        messages,
-    )
+    clear_stepca_bind_intent_to(&StateFile::default_path(), compose_dir, messages)
 }
 
 fn clear_stepca_bind_intent_to(
     state_path: &Path,
     compose_dir: &Path,
-    secrets_tree: &SecretsTree,
     messages: &Messages,
 ) -> Result<()> {
     if !state_path.exists() {
@@ -2539,11 +2480,7 @@ fn clear_stepca_bind_intent_to(
     state
         .save(state_path)
         .with_context(|| messages.error_serialize_state_failed())?;
-    let override_path = compose_dir
-        .join("secrets")
-        .join("step-ca")
-        .join(STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME);
-    remove_exposure_override(secrets_tree, &override_path, messages)?;
+    compose_overrides::remove(compose_dir, ComposeOverride::StepCaExposed, messages)?;
     println!("{}", messages.info_stepca_bind_intent_cleared());
     Ok(())
 }
@@ -2966,12 +2903,12 @@ mod tests {
 
     use super::*;
     use crate::commands::compose_project::DOCKER_COMPOSE_SUBCOMMAND;
+    use crate::commands::init::{
+        HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME,
+        RESPONDER_COMPOSE_OVERRIDE_NAME, RESPONDER_CONFIG_DIR,
+        STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME,
+    };
     use crate::i18n::test_messages;
-
-    /// The handle `infra install` opens on `compose_dir/secrets`.
-    fn compose_tree(compose_dir: &Path) -> SecretsTree {
-        SecretsTree::open(&compose_dir.join("secrets")).expect("open secrets tree")
-    }
 
     /// `ROOT_BY_POLICY_DIRS`, which a rooted walk requires to be owned by
     /// the writing process, names exactly what the ownership sweep holds
@@ -3000,71 +2937,101 @@ mod tests {
         assert_eq!(skipped, expected);
     }
 
-    /// As root over a foreign-owned `secrets/`, each bind-intent clear
-    /// removes its override through the handle and refuses a swapped
-    /// directory rather than removing a file it points at.
+    /// Each bind-intent clear removes its override from
+    /// `compose-overrides/` and leaves anything at its `0.7.0` place
+    /// below `secrets/`; a `compose-overrides` that is a link is refused
+    /// rather than followed into the directory it points at.
     #[test]
-    fn rooted_clear_bind_intents_refuse_a_swapped_override_dir() {
-        type Clear = fn(&Path, &Path, &SecretsTree, &Messages) -> Result<()>;
-        type Case = (&'static str, &'static str, Clear, fn(&mut StateFile));
+    fn clear_bind_intents_remove_from_compose_overrides() {
+        type Clear = fn(&Path, &Path, &Messages) -> Result<()>;
+        type Case = (ComposeOverride, Clear, fn(&mut StateFile));
         let cases: [Case; 3] = [
             (
-                "openbao",
-                OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME,
-                |state, dir, tree, messages| {
-                    clear_openbao_bind_intent_to(
-                        state,
-                        dir,
-                        tree,
-                        "http://127.0.0.1:8200",
-                        messages,
-                    )
+                ComposeOverride::OpenBaoExposed,
+                |state, dir, messages| {
+                    clear_openbao_bind_intent_to(state, dir, "http://127.0.0.1:8200", messages)
                 },
                 |state| state.openbao_bind_addr = Some("192.168.1.10:8200".to_string()),
             ),
             (
-                "responder",
-                HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME,
+                ComposeOverride::Http01Exposed,
                 clear_http01_admin_bind_intent_to,
                 |state| state.http01_admin_bind_addr = Some("192.168.1.10:8080".to_string()),
             ),
             (
-                "step-ca",
-                STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME,
+                ComposeOverride::StepCaExposed,
                 clear_stepca_bind_intent_to,
                 |state| state.stepca_bind_addr = Some("192.168.1.10:9000".to_string()),
             ),
         ];
-        for (sub, name, clear, record) in cases {
-            for swapped in [false, true] {
-                let root = crate::test_support::SwapRoot::new();
-                let compose_dir = root.root();
+        let messages = test_messages();
+        for (which, clear, record) in cases {
+            for linked in [false, true] {
+                let dir = tempdir().unwrap();
+                let compose_dir = dir.path();
                 let state_path = compose_dir.join("state.json");
                 let mut state = StateFile::default();
                 record(&mut state);
                 state.save(&state_path).unwrap();
-                root.write(&format!("{sub}/{name}"), "services: {}\n");
-                std::fs::write(root.outside.join(name), "outside").unwrap();
-                let tree = root.rooted();
-                let before = root.outside_snapshot();
-                if swapped {
-                    let link = root.swap(sub, &root.outside);
-                    let err = clear(&state_path, compose_dir, &tree, &test_messages())
-                        .expect_err("swapped override dir");
-                    crate::test_support::assert_error_names(&err, &link);
-                } else if sub == "openbao" {
+                let legacy = which.legacy_path(compose_dir, &compose_dir.join("secrets"));
+                std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+                std::fs::write(&legacy, "old").unwrap();
+                let elsewhere = compose_dir.join("elsewhere");
+                std::fs::create_dir(&elsewhere).unwrap();
+                let victim = elsewhere.join(which.file_name());
+                std::fs::write(&victim, "kept").unwrap();
+                let current = compose_overrides::path(compose_dir, which);
+                if linked {
+                    std::os::unix::fs::symlink(
+                        &elsewhere,
+                        compose_overrides::overrides_dir(compose_dir),
+                    )
+                    .unwrap();
+                    let err = clear(&state_path, compose_dir, &messages)
+                        .expect_err("a linked compose-overrides is refused");
+                    crate::test_support::assert_error_names(
+                        &err,
+                        &compose_overrides::overrides_dir(compose_dir),
+                    );
+                    assert!(victim.exists(), "{which:?}");
+                } else {
+                    compose_overrides::write(compose_dir, which, "services: {}\n", &messages)
+                        .unwrap();
                     // The openbao clear goes on to rewrite openbao.hcl,
                     // which needs a compose layout this test does not
                     // build; the override removal precedes it.
-                    let _ = clear(&state_path, compose_dir, &tree, &test_messages());
-                    assert!(!root.secrets.join(sub).join(name).exists(), "{sub}");
-                } else {
-                    clear(&state_path, compose_dir, &tree, &test_messages()).unwrap();
-                    assert!(!root.secrets.join(sub).join(name).exists(), "{sub}");
+                    let _ = clear(&state_path, compose_dir, &messages);
+                    assert!(!current.exists(), "{which:?}");
                 }
-                assert_eq!(root.outside_snapshot(), before, "{sub} swapped={swapped}");
+                assert_eq!(std::fs::read_to_string(&legacy).unwrap(), "old");
             }
         }
+    }
+
+    /// `infra install` with all three bind options writes its overrides
+    /// in `compose-overrides/` and nothing below `secrets/`.
+    #[test]
+    fn exposure_writers_leave_nothing_below_secrets() {
+        let dir = tempdir().unwrap();
+        let messages = test_messages();
+        std::fs::create_dir(dir.path().join("secrets")).unwrap();
+        let written = [
+            write_openbao_exposed_override(dir.path(), "192.168.1.10:8200", &messages).unwrap(),
+            write_http01_exposed_override(dir.path(), "192.168.1.10:8080", &messages).unwrap(),
+            write_stepca_exposed_override(dir.path(), "192.168.1.10:9000", &messages).unwrap(),
+        ];
+        for path in &written {
+            assert_eq!(
+                path.parent(),
+                Some(compose_overrides::overrides_dir(dir.path()).as_path())
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("secrets"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     /// `infra up`'s auto-detected unseal-key file, over a rooted handle:
@@ -3851,7 +3818,7 @@ mod tests {
         let (dir, compose_file, hcl) = audit_device_fixture();
         let override_path = dir
             .path()
-            .join("secrets/openbao/docker-compose.openbao-audit.yml");
+            .join("compose-overrides/docker-compose.openbao-audit.yml");
         sync_openbao_audit_device_for_up(
             &compose_file,
             &["openbao".to_string()],
@@ -4949,8 +4916,8 @@ mod tests {
     #[test]
     fn the_bring_up_file_order_covers_every_combination() {
         let compose = "docker-compose.yml";
-        let exposed = "secrets/openbao/docker-compose.openbao-exposed.yml";
-        let audit = "secrets/openbao/docker-compose.openbao-audit.yml";
+        let exposed = "compose-overrides/docker-compose.openbao-exposed.yml";
+        let audit = "compose-overrides/docker-compose.openbao-audit.yml";
         let files = |openbao, audit| {
             up_compose_files(&UpComposeOverrides {
                 compose_file: compose,
@@ -4971,8 +4938,8 @@ mod tests {
     #[test]
     fn the_bring_up_file_order_ends_with_the_postgres_tls_override() {
         let compose = "docker-compose.yml";
-        let stepca = "secrets/step-ca/docker-compose.stepca-exposed.yml";
-        let postgres_tls = "secrets/postgres/docker-compose.postgres-tls.yml";
+        let stepca = "compose-overrides/docker-compose.stepca-exposed.yml";
+        let postgres_tls = "compose-overrides/docker-compose.postgres-tls.yml";
         let files = |stepca, postgres_tls| {
             up_compose_files(&UpComposeOverrides {
                 compose_file: compose,
@@ -5035,16 +5002,129 @@ mod tests {
         let messages = crate::i18n::test_messages();
         let dir = tempfile::tempdir().unwrap();
         let (compose_file, state_path) = postgres_compose_and_state(dir.path());
-        let override_path = dir
-            .path()
-            .join("secrets/postgres/docker-compose.postgres-tls.yml");
-        std::fs::create_dir_all(override_path.parent().unwrap()).unwrap();
-        std::fs::write(&override_path, "services: {}").unwrap();
+        let override_path = compose_overrides::write(
+            dir.path(),
+            ComposeOverride::PostgresTls,
+            "services: {}",
+            &messages,
+        )
+        .unwrap();
+        assert!(override_path.ends_with("compose-overrides/docker-compose.postgres-tls.yml"));
 
         assert_eq!(
             resolve_postgres_tls_override(&state_path, dir.path(), &compose_file, &messages)
                 .unwrap(),
             Some(override_path)
+        );
+    }
+
+    /// The `infra up` probe of decision 6: after `init` (state.json
+    /// present, the service declared), an override that exists only at
+    /// its `0.7.0` place stops the run naming both paths; before
+    /// `init`, or for a compose file without the service, nothing is
+    /// probed; and with both files present the old one is ignored.
+    #[test]
+    fn infra_up_probes_the_legacy_postgres_and_responder_overrides() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let (compose_file, state_path) = postgres_compose_and_state(dir.path());
+        let secrets = dir.path().join("secrets");
+        for which in [ComposeOverride::PostgresTls, ComposeOverride::Responder] {
+            let legacy = which.legacy_path(dir.path(), &secrets);
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, "services: {}").unwrap();
+        }
+        let postgres =
+            || resolve_postgres_tls_override(&state_path, dir.path(), &compose_file, &messages);
+        let responder = || resolve_responder_compose_override(&state_path, dir.path(), &messages);
+        for (result, which) in [
+            (postgres(), ComposeOverride::PostgresTls),
+            (responder(), ComposeOverride::Responder),
+        ] {
+            let err = result.expect_err("legacy-only");
+            assert_eq!(
+                err.to_string(),
+                messages.error_compose_override_legacy_init(
+                    &compose_overrides::path(dir.path(), which)
+                        .display()
+                        .to_string(),
+                    &which
+                        .legacy_path(dir.path(), &secrets)
+                        .display()
+                        .to_string()
+                )
+            );
+        }
+
+        // A compose file without `postgres` does not probe.
+        let bare = dir.path().join("bare.yml");
+        std::fs::write(&bare, "services: {}\n").unwrap();
+        assert!(
+            resolve_postgres_tls_override(&state_path, dir.path(), &bare, &messages)
+                .unwrap()
+                .is_none()
+        );
+
+        // Both present: the new one is used.
+        for which in [ComposeOverride::PostgresTls, ComposeOverride::Responder] {
+            compose_overrides::write(dir.path(), which, "services: {}", &messages).unwrap();
+        }
+        assert_eq!(
+            postgres().unwrap(),
+            Some(compose_overrides::path(
+                dir.path(),
+                ComposeOverride::PostgresTls
+            ))
+        );
+        assert_eq!(
+            responder().unwrap(),
+            Some(compose_overrides::path(
+                dir.path(),
+                ComposeOverride::Responder
+            ))
+        );
+
+        // Before `init`, nothing is probed.
+        std::fs::remove_file(&state_path).unwrap();
+        std::fs::remove_dir_all(compose_overrides::overrides_dir(dir.path())).unwrap();
+        assert!(postgres().unwrap().is_none());
+        assert!(responder().unwrap().is_none());
+    }
+
+    /// An exposure override whose bind intent is recorded is probed at
+    /// its `0.7.0` place; without the intent nothing is read at all.
+    #[test]
+    fn infra_up_probes_a_recorded_exposure_override_only() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let legacy =
+            ComposeOverride::StepCaExposed.legacy_path(dir.path(), &dir.path().join("secrets"));
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "services: {}").unwrap();
+
+        state_with_stepca_bind(None, None)
+            .save(&state_path)
+            .unwrap();
+        assert!(
+            resolve_stepca_exposed_override(&state_path, dir.path(), &messages)
+                .unwrap()
+                .is_none()
+        );
+
+        state_with_stepca_bind(Some("192.168.1.10:9000"), None)
+            .save(&state_path)
+            .unwrap();
+        let err = resolve_stepca_exposed_override(&state_path, dir.path(), &messages)
+            .expect_err("legacy-only");
+        assert_eq!(
+            err.to_string(),
+            messages.error_compose_override_legacy_exposure(
+                &compose_overrides::path(dir.path(), ComposeOverride::StepCaExposed)
+                    .display()
+                    .to_string(),
+                &legacy.display().to_string()
+            )
         );
     }
 
@@ -5058,7 +5138,7 @@ mod tests {
         std::fs::write(&compose_file, "services: {}\n").unwrap();
         let override_path = dir
             .path()
-            .join("secrets/postgres/docker-compose.postgres-tls.yml");
+            .join("compose-overrides/docker-compose.postgres-tls.yml");
         std::fs::create_dir_all(override_path.parent().unwrap()).unwrap();
         std::fs::write(&override_path, "services: {}").unwrap();
 
@@ -5510,19 +5590,12 @@ mod tests {
             ..Default::default()
         };
         state.save(&state_path).unwrap();
-        let override_dir = dir.path().join("secrets").join("openbao");
+        let override_dir = compose_overrides::overrides_dir(dir.path());
         std::fs::create_dir_all(&override_dir).unwrap();
         let override_path = override_dir.join(OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME);
         std::fs::write(&override_path, "placeholder").unwrap();
 
-        clear_openbao_bind_intent_to(
-            &state_path,
-            dir.path(),
-            &compose_tree(dir.path()),
-            loopback_url,
-            &messages,
-        )
-        .unwrap();
+        clear_openbao_bind_intent_to(&state_path, dir.path(), loopback_url, &messages).unwrap();
 
         let reloaded = StateFile::load(&state_path).unwrap();
         assert!(
@@ -5560,14 +5633,8 @@ mod tests {
         };
         state.save(&state_path).unwrap();
 
-        clear_openbao_bind_intent_to(
-            &state_path,
-            dir.path(),
-            &compose_tree(dir.path()),
-            "http://127.0.0.1:8200",
-            &messages,
-        )
-        .unwrap();
+        clear_openbao_bind_intent_to(&state_path, dir.path(), "http://127.0.0.1:8200", &messages)
+            .unwrap();
 
         let reloaded = StateFile::load(&state_path).unwrap();
         assert!(reloaded.openbao_bind_addr.is_none());
@@ -5581,14 +5648,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.json");
 
-        clear_openbao_bind_intent_to(
-            &state_path,
-            dir.path(),
-            &compose_tree(dir.path()),
-            "http://127.0.0.1:8200",
-            &messages,
-        )
-        .unwrap();
+        clear_openbao_bind_intent_to(&state_path, dir.path(), "http://127.0.0.1:8200", &messages)
+            .unwrap();
 
         assert!(!state_path.exists());
     }
@@ -5623,7 +5684,7 @@ mod tests {
             ..Default::default()
         };
         state.save(&state_path).unwrap();
-        let override_dir = dir.path().join("secrets").join("openbao");
+        let override_dir = compose_overrides::overrides_dir(dir.path());
         std::fs::create_dir_all(&override_dir).unwrap();
         std::fs::write(
             override_dir.join(OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME),
@@ -5632,14 +5693,7 @@ mod tests {
         .unwrap();
 
         let loopback_url = "http://127.0.0.1:8200";
-        clear_openbao_bind_intent_to(
-            &state_path,
-            dir.path(),
-            &compose_tree(dir.path()),
-            loopback_url,
-            &messages,
-        )
-        .unwrap();
+        clear_openbao_bind_intent_to(&state_path, dir.path(), loopback_url, &messages).unwrap();
 
         let reloaded = StateFile::load(&state_path).unwrap();
         assert!(
@@ -5679,7 +5733,7 @@ mod tests {
         };
         state.save(&state_path).unwrap();
         // Write an override with a widened wildcard binding.
-        let override_dir = dir.path().join("secrets").join("openbao");
+        let override_dir = compose_overrides::overrides_dir(dir.path());
         std::fs::create_dir_all(&override_dir).unwrap();
         std::fs::write(
             override_dir.join(OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME),
@@ -5943,7 +5997,7 @@ services:
             ..Default::default()
         };
         state.save(&state_path).unwrap();
-        let override_dir = dir.path().join("secrets").join("openbao");
+        let override_dir = compose_overrides::overrides_dir(dir.path());
         std::fs::create_dir_all(&override_dir).unwrap();
         std::fs::write(
             override_dir.join(OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME),
@@ -5951,14 +6005,8 @@ services:
         )
         .unwrap();
 
-        clear_openbao_bind_intent_to(
-            &state_path,
-            dir.path(),
-            &compose_tree(dir.path()),
-            "http://127.0.0.1:8200",
-            &messages,
-        )
-        .unwrap();
+        clear_openbao_bind_intent_to(&state_path, dir.path(), "http://127.0.0.1:8200", &messages)
+            .unwrap();
 
         let reloaded = StateFile::load(&state_path).unwrap();
         assert!(
@@ -6002,7 +6050,7 @@ services:
             r#"listener "tcp" { tls_cert_file = "/openbao/config/tls/server.crt" }"#,
         )
         .unwrap();
-        let override_dir = dir.path().join("secrets").join("openbao");
+        let override_dir = compose_overrides::overrides_dir(dir.path());
         std::fs::create_dir_all(&override_dir).unwrap();
         std::fs::write(
             override_dir.join(OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME),
@@ -6010,14 +6058,8 @@ services:
         )
         .unwrap();
 
-        clear_openbao_bind_intent_to(
-            &state_path,
-            dir.path(),
-            &compose_tree(dir.path()),
-            "http://127.0.0.1:8200",
-            &messages,
-        )
-        .unwrap();
+        clear_openbao_bind_intent_to(&state_path, dir.path(), "http://127.0.0.1:8200", &messages)
+            .unwrap();
 
         let content = std::fs::read_to_string(&hcl_path).unwrap();
         assert!(
@@ -6054,7 +6096,7 @@ services:
             ..Default::default()
         };
         state.save(&state_path).unwrap();
-        let override_dir = dir.path().join("secrets").join("openbao");
+        let override_dir = compose_overrides::overrides_dir(dir.path());
         std::fs::create_dir_all(&override_dir).unwrap();
         std::fs::write(
             override_dir.join(OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME),
@@ -6062,14 +6104,8 @@ services:
         )
         .unwrap();
 
-        clear_openbao_bind_intent_to(
-            &state_path,
-            dir.path(),
-            &compose_tree(dir.path()),
-            "http://127.0.0.1:8200",
-            &messages,
-        )
-        .unwrap();
+        clear_openbao_bind_intent_to(&state_path, dir.path(), "http://127.0.0.1:8200", &messages)
+            .unwrap();
 
         let reloaded = StateFile::load(&state_path).unwrap();
         assert!(reloaded.openbao_bind_addr.is_none());
@@ -6183,18 +6219,12 @@ services:
             ..Default::default()
         };
         state.save(&state_path).unwrap();
-        let override_dir = dir.path().join("secrets").join("responder");
+        let override_dir = compose_overrides::overrides_dir(dir.path());
         std::fs::create_dir_all(&override_dir).unwrap();
         let override_path = override_dir.join(HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME);
         std::fs::write(&override_path, "placeholder").unwrap();
 
-        clear_http01_admin_bind_intent_to(
-            &state_path,
-            dir.path(),
-            &compose_tree(dir.path()),
-            &messages,
-        )
-        .unwrap();
+        clear_http01_admin_bind_intent_to(&state_path, dir.path(), &messages).unwrap();
 
         let reloaded = StateFile::load(&state_path).unwrap();
         assert!(
@@ -6250,7 +6280,7 @@ services:
             ..Default::default()
         };
         state.save(&state_path).unwrap();
-        let override_dir = dir.path().join("secrets").join("responder");
+        let override_dir = compose_overrides::overrides_dir(dir.path());
         std::fs::create_dir_all(&override_dir).unwrap();
         std::fs::write(
             override_dir.join(HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME),
@@ -6258,13 +6288,7 @@ services:
         )
         .unwrap();
 
-        clear_http01_admin_bind_intent_to(
-            &state_path,
-            dir.path(),
-            &compose_tree(dir.path()),
-            &messages,
-        )
-        .unwrap();
+        clear_http01_admin_bind_intent_to(&state_path, dir.path(), &messages).unwrap();
 
         let reloaded = StateFile::load(&state_path).unwrap();
         assert!(
@@ -6421,13 +6445,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"\n";
         let messages = crate::i18n::test_messages();
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.json");
-        clear_http01_admin_bind_intent_to(
-            &state_path,
-            dir.path(),
-            &compose_tree(dir.path()),
-            &messages,
-        )
-        .unwrap();
+        clear_http01_admin_bind_intent_to(&state_path, dir.path(), &messages).unwrap();
         assert!(!state_path.exists());
     }
 
@@ -6478,18 +6496,12 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"\n";
             ..Default::default()
         };
         state.save(&state_path).unwrap();
-        let override_dir = dir.path().join("secrets").join("responder");
+        let override_dir = compose_overrides::overrides_dir(dir.path());
         std::fs::create_dir_all(&override_dir).unwrap();
         let override_path = override_dir.join(HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME);
         std::fs::write(&override_path, "placeholder").unwrap();
 
-        clear_http01_admin_bind_intent_to(
-            &state_path,
-            dir.path(),
-            &compose_tree(dir.path()),
-            &messages,
-        )
-        .unwrap();
+        clear_http01_admin_bind_intent_to(&state_path, dir.path(), &messages).unwrap();
 
         let reloaded = StateFile::load(&state_path).unwrap();
         assert!(reloaded.http01_admin_bind_addr.is_none());
@@ -6829,18 +6841,12 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
         state_with_stepca_bind(Some("192.168.1.10:9000"), None)
             .save(&state_path)
             .unwrap();
-        let override_dir = dir.path().join("secrets").join("step-ca");
+        let override_dir = compose_overrides::overrides_dir(dir.path());
         std::fs::create_dir_all(&override_dir).unwrap();
         let override_path = override_dir.join(STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME);
         std::fs::write(&override_path, "placeholder").unwrap();
 
-        clear_stepca_bind_intent_to(
-            &state_path,
-            dir.path(),
-            &compose_tree(dir.path()),
-            &messages,
-        )
-        .unwrap();
+        clear_stepca_bind_intent_to(&state_path, dir.path(), &messages).unwrap();
 
         let reloaded = StateFile::load(&state_path).unwrap();
         assert!(
@@ -6862,13 +6868,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
             .save(&state_path)
             .unwrap();
 
-        clear_stepca_bind_intent_to(
-            &state_path,
-            dir.path(),
-            &compose_tree(dir.path()),
-            &messages,
-        )
-        .unwrap();
+        clear_stepca_bind_intent_to(&state_path, dir.path(), &messages).unwrap();
 
         let reloaded = StateFile::load(&state_path).unwrap();
         assert!(reloaded.stepca_bind_addr.is_none());
@@ -6883,15 +6883,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
         let messages = crate::i18n::test_messages();
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.json");
-        assert!(
-            clear_stepca_bind_intent_to(
-                &state_path,
-                dir.path(),
-                &compose_tree(dir.path()),
-                &messages
-            )
-            .is_ok()
-        );
+        assert!(clear_stepca_bind_intent_to(&state_path, dir.path(), &messages).is_ok());
     }
 
     #[test]
@@ -6946,7 +6938,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
         write_stepca_exposed_override(dir.path(), "192.168.1.10:9000", &messages).unwrap();
         let result = resolve_stepca_exposed_override(&state_path, dir.path(), &messages);
         let path = result.unwrap().expect("override path must be resolved");
-        assert!(path.ends_with("secrets/step-ca/docker-compose.stepca-exposed.yml"));
+        assert!(path.ends_with("compose-overrides/docker-compose.stepca-exposed.yml"));
     }
 
     /// Regression: the documented fresh path `infra install
@@ -6975,7 +6967,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
         let path = result
             .unwrap()
             .expect("install-recorded intent must resolve for init");
-        assert!(path.ends_with("secrets/step-ca/docker-compose.stepca-exposed.yml"));
+        assert!(path.ends_with("compose-overrides/docker-compose.stepca-exposed.yml"));
     }
 
     #[test]
@@ -6996,7 +6988,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
     fn resolve_responder_config_override_returns_none_without_state() {
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.json");
-        let result = resolve_responder_compose_override(&state_path, dir.path());
+        let result = resolve_responder_compose_override(&state_path, dir.path(), &test_messages());
         assert!(result.unwrap().is_none());
     }
 
@@ -7021,7 +7013,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
             ..Default::default()
         };
         state.save(&state_path).unwrap();
-        let result = resolve_responder_compose_override(&state_path, dir.path());
+        let result = resolve_responder_compose_override(&state_path, dir.path(), &test_messages());
         assert!(result.unwrap().is_none());
     }
 
@@ -7044,7 +7036,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
         state.save(&state_path).unwrap();
 
         // Simulate init having written the override file.
-        let override_dir = dir.path().join("secrets").join(RESPONDER_CONFIG_DIR);
+        let override_dir = compose_overrides::overrides_dir(dir.path());
         std::fs::create_dir_all(&override_dir).unwrap();
         std::fs::write(
             override_dir.join(RESPONDER_COMPOSE_OVERRIDE_NAME),
@@ -7052,11 +7044,11 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
         )
         .unwrap();
 
-        let path = resolve_responder_compose_override(&state_path, dir.path())
+        let path = resolve_responder_compose_override(&state_path, dir.path(), &test_messages())
             .unwrap()
             .expect("must return the override path without a recorded bind intent");
         assert!(
-            path.ends_with("secrets/responder/docker-compose.responder.override.yml"),
+            path.ends_with("compose-overrides/docker-compose.responder.override.yml"),
             "unexpected override path: {}",
             path.display()
         );
@@ -7085,7 +7077,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
         state.save(&state_path).unwrap();
         // Bind intent present but init has not run yet — override
         // file does not exist.
-        let result = resolve_responder_compose_override(&state_path, dir.path());
+        let result = resolve_responder_compose_override(&state_path, dir.path(), &test_messages());
         assert!(result.unwrap().is_none());
     }
 
@@ -7115,7 +7107,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
         state.save(&state_path).unwrap();
 
         // Simulate init having written the override file.
-        let override_dir = dir.path().join("secrets").join(RESPONDER_CONFIG_DIR);
+        let override_dir = compose_overrides::overrides_dir(dir.path());
         std::fs::create_dir_all(&override_dir).unwrap();
         std::fs::write(
             override_dir.join(RESPONDER_COMPOSE_OVERRIDE_NAME),
@@ -7123,7 +7115,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
         )
         .unwrap();
 
-        let result = resolve_responder_compose_override(&state_path, dir.path());
+        let result = resolve_responder_compose_override(&state_path, dir.path(), &test_messages());
         assert!(
             result.unwrap().is_some(),
             "must return the override path when bind intent and file both exist"
@@ -7131,9 +7123,9 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
     }
 
     /// Regression: when `bootroot init` used a non-default `--secrets-dir`,
-    /// `resolve_responder_compose_override` must look for the override
-    /// file under the persisted `secrets_dir`, not the hardcoded
-    /// `<compose_dir>/secrets`.
+    /// `resolve_responder_compose_override` reads the override from
+    /// `compose-overrides/` whatever the persisted `secrets_dir`, and
+    /// probes that `secrets_dir` only for the `0.7.0` file.
     #[test]
     fn resolve_responder_config_override_uses_nondefault_secrets_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -7159,21 +7151,35 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
         };
         state.save(&state_path).unwrap();
 
-        // Write the override under the custom secrets dir (where init
-        // would have placed it), NOT under compose_dir/secrets.
-        let override_dir = custom_secrets.join(RESPONDER_CONFIG_DIR);
-        std::fs::create_dir_all(&override_dir).unwrap();
-        std::fs::write(
-            override_dir.join(RESPONDER_COMPOSE_OVERRIDE_NAME),
+        // Where `0.7.0`'s init placed it, under the custom secrets dir:
+        // not read, and `infra up` stops naming both paths.
+        let legacy_dir = custom_secrets.join(RESPONDER_CONFIG_DIR);
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy = legacy_dir.join(RESPONDER_COMPOSE_OVERRIDE_NAME);
+        std::fs::write(&legacy, "services: {}").unwrap();
+        let current = compose_overrides::path(&compose_dir, ComposeOverride::Responder);
+        let err = resolve_responder_compose_override(&state_path, &compose_dir, &test_messages())
+            .expect_err("legacy-only");
+        assert_eq!(
+            err.to_string(),
+            test_messages().error_compose_override_legacy_init(
+                &current.display().to_string(),
+                &legacy.display().to_string()
+            )
+        );
+
+        // The override is beside the compose file whatever the secrets
+        // dir is, and with it there the old file is ignored.
+        compose_overrides::write(
+            &compose_dir,
+            ComposeOverride::Responder,
             "services: {}",
+            &test_messages(),
         )
         .unwrap();
-
-        let result = resolve_responder_compose_override(&state_path, &compose_dir);
-        assert!(
-            result.unwrap().is_some(),
-            "must find override under custom secrets_dir, not hardcoded compose_dir/secrets"
-        );
+        let result =
+            resolve_responder_compose_override(&state_path, &compose_dir, &test_messages());
+        assert_eq!(result.unwrap(), Some(current));
     }
 
     /// Regression: `infra install --http01-admin-bind` must reject
@@ -7264,7 +7270,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
         state.save(&state_path).unwrap();
 
         // Write the exposed override file (required by the function).
-        let override_dir = compose_dir.join("secrets").join("responder");
+        let override_dir = compose_overrides::overrides_dir(&compose_dir);
         std::fs::create_dir_all(&override_dir).unwrap();
         std::fs::write(
             override_dir.join(HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME),
@@ -7580,28 +7586,10 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
             state.http01_admin_bind_addr = Some("192.168.1.10:8080".to_string());
             state.save(&state_path).unwrap();
 
-            clear_openbao_bind_intent_to(
-                &state_path,
-                dir.path(),
-                &compose_tree(dir.path()),
-                INSTALL_OPENBAO_URL,
-                &messages,
-            )
-            .unwrap();
-            clear_http01_admin_bind_intent_to(
-                &state_path,
-                dir.path(),
-                &compose_tree(dir.path()),
-                &messages,
-            )
-            .unwrap();
-            clear_stepca_bind_intent_to(
-                &state_path,
-                dir.path(),
-                &compose_tree(dir.path()),
-                &messages,
-            )
-            .unwrap();
+            clear_openbao_bind_intent_to(&state_path, dir.path(), INSTALL_OPENBAO_URL, &messages)
+                .unwrap();
+            clear_http01_admin_bind_intent_to(&state_path, dir.path(), &messages).unwrap();
+            clear_stepca_bind_intent_to(&state_path, dir.path(), &messages).unwrap();
             sync_state_openbao_url_to(&state_path, "http://localhost:28200", &messages).unwrap();
 
             let after = StateFile::load(&state_path).unwrap();

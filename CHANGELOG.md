@@ -4,6 +4,39 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- The compose overrides that `infra install` and `init` write now live in
+  `compose-overrides/` beside the compose file instead of below `secrets/`.
+  They are always `0644` and owned by the account that writes them. A mode
+  narrowed by hand, or a symbolic link at one of their names, is no longer
+  kept.
+- Every bootroot command that uses the compose overrides stops with an error
+  naming the path when the directory or a file in it is owned by anyone other
+  than root, you, or the owner of the compose directory; when the directory or
+  a file is group- or world-writable; or when the compose directory itself is
+  group- or world-writable.
+- `infra up`, `init` and `reinit` stop with an error naming both paths when an
+  override they need exists only at its former place below `secrets/`. It is
+  recreated by re-running `infra install` with the host's bind options, or
+  `init`, or by copying a reviewed old file to the new path.
+- Anyone who passes the PostgreSQL TLS override to their own `docker compose`
+  uses the new path, `compose-overrides/docker-compose.postgres-tls.yml`.
+
+### Security
+
+- The compose overrides were kept below `secrets/`. step-ca and both OpenBao
+  Agent containers mount that tree read-write, and when it was given to another
+  account it was that account's. `infra up`, `init` and `clean` passed the
+  overrides to `docker compose` by name after checking only their published
+  ports, so whoever could write `secrets/` could change what bootroot started
+  next, as root when bootroot ran as root. They now sit outside every container
+  mount, writable only by root, the account that runs bootroot, or the owner of
+  the compose directory, and they are checked for owner, mode and links before
+  each use.
+
 ## [0.7.0] - 2026-11-05
 
 ### Added
@@ -3187,6 +3220,7 @@ byte for byte.
 
 - Initial public release of the bootroot
 
+[Unreleased]: https://github.com/aicers/bootroot/compare/0.7.0...HEAD
 [0.7.0]: https://github.com/aicers/bootroot/compare/0.6.0...0.7.0
 [0.6.0]: https://github.com/aicers/bootroot/compare/0.5.0...0.6.0
 [0.5.0]: https://github.com/aicers/bootroot/compare/0.4.0...0.5.0

@@ -50,6 +50,8 @@ ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/tmp/e2e/docker-openbao-user-$(date +%s)}
 mkdir -p "$ARTIFACT_DIR"
 ARTIFACT_DIR="$(cd "$ARTIFACT_DIR" && pwd)"
 COMPOSE_FILE="${COMPOSE_FILE:-$ROOT_DIR/docker-compose.yml}"
+# Where `infra install` and `init` write every compose override.
+COMPOSE_OVERRIDES_DIR="$(dirname "$COMPOSE_FILE")/compose-overrides"
 COMPOSE_TEST_FILE="${COMPOSE_TEST_FILE:-$ROOT_DIR/docker-compose.test.yml}"
 WORKSPACE_DIR="${WORKSPACE_DIR:-$ARTIFACT_DIR/workspace}"
 # Not overridable: `infra install` writes its overrides under the
@@ -79,7 +81,7 @@ BIND_HOST="${BIND_HOST:-$BIND_HOST_DEFAULT}"
 OPENBAO_BIND_ADDR="${BIND_HOST}:8200"
 STEPCA_BIND_ADDR="${BIND_HOST}:9000"
 HTTP01_ADMIN_BIND_ADDR="${BIND_HOST}:8080"
-EXPOSED_OVERRIDE_PATH="$SECRETS_DIR/openbao/docker-compose.openbao-exposed.yml"
+EXPOSED_OVERRIDE_PATH="$COMPOSE_OVERRIDES_DIR/docker-compose.openbao-exposed.yml"
 OPENBAO_REPO_DIR="$ROOT_DIR/openbao"
 OPENBAO_REPO_HCL="$OPENBAO_REPO_DIR/openbao.hcl"
 OPENBAO_REPO_CONFIG_DIR="$OPENBAO_REPO_DIR/config"
@@ -338,6 +340,9 @@ restore_ownership() {
       run_sudo chown -R -h "$owner" "$path" >/dev/null 2>&1 || true
     fi
   done
+  # Removed rather than handed back: the overrides root wrote there,
+  # left in the checkout, would be applied by the next run.
+  run_sudo rm -rf "$COMPOSE_OVERRIDES_DIR" >/dev/null 2>&1 || true
   ROOT_WROTE=0
 }
 
@@ -455,7 +460,7 @@ prepare_secrets_dir() {
   ROOT_WROTE=1
   rm -f "$WORKSPACE_DIR/state.json"
   run_sudo rm -f "$ROOT_DIR/.env"
-  run_sudo rm -rf "$SECRETS_DIR"
+  run_sudo rm -rf "$SECRETS_DIR" "$COMPOSE_OVERRIDES_DIR"
   run_sudo install -d -m 0700 -o "$SECRETS_UID" -g "$SECRETS_GID" "$SECRETS_DIR" \
     || fail "failed to create $SECRETS_DIR for ${SECRETS_ACCOUNT}"
   assert_entry_state "$SECRETS_DIR" "${SECRETS_UID}:${SECRETS_GID} 700" "prepared"

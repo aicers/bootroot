@@ -90,6 +90,9 @@ registrar_docker_assert_no_backend_credentials() {
 registrar_docker_prepare_deployment_tree() {
   local project_dir="$1" work_dir="$2"
   mkdir -p "$work_dir/openbao" || fail "could not create registrar deployment tree"
+  # bootroot refuses compose overrides beside a compose directory the
+  # group or others can write, which a `002` umask would leave.
+  chmod 0755 "$work_dir" || fail "could not set the mode of the registrar deployment tree"
   cp "$project_dir/docker-compose.deploy.yml" "$work_dir/" ||
     fail "could not copy the deploy compose file"
   cp "$project_dir/openbao/openbao.hcl" "$work_dir/openbao/" ||

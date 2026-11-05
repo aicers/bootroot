@@ -125,7 +125,7 @@
 실행이 PostgreSQL TLS 오버라이드를 빠뜨려 Compose가 PostgreSQL을 TLS 없이
 다시 생성한 것입니다. 평문으로 되돌아가는 경로는 없습니다.
 
-- `secrets/postgres/docker-compose.postgres-tls.yml`을 적용하는
+- `compose-overrides/docker-compose.postgres-tls.yml`을 적용하는
   `bootroot infra up`을 실행하거나, 그 파일을 `-f` 목록에 추가
 - 초기화된 스택 위에서 `bootroot infra install`을 다시 실행한 뒤에도
   같은 상황이 되며, `bootroot infra up`이 복원
@@ -138,6 +138,25 @@
 모드를 직접 바꾸면 PostgreSQL이 시작하지 못합니다. `bootroot rotate
 infra-cert`나 `init` 재실행이 이를 다시 적용합니다. 인증서 검증 오류나
 인증 오류는 대기를 즉시 끝냅니다.
+
+### compose 오버라이드가 거부됨
+
+`infra up`, `init`, `reinit`, `clean`은 모든 compose 오버라이드를
+`docker compose`에 넘기기 전에 검사합니다.
+[운영](operations.md#compose-overrides-beside-the-compose-file)을 참고하세요.
+
+- `… 모드 …은(는) 그룹이나 다른 사용자가 쓸 수 있게 합니다`: 오류가 명시한 경로에
+  `chmod g-w,o-w`를 실행하세요. compose 디렉터리 자체라면 대개 umask `002`로 만든
+  체크아웃입니다.
+- `… uid …의 소유이며`: 파일이나 `compose-overrides/`가 root, bootroot를 실행하는
+  계정, compose 디렉터리의 소유자 이외의 계정 소유입니다. 내용을 검토한 뒤 지우고,
+  그것을 작성하는 명령(호스트의 바인드 옵션을 준 `infra install`, 또는 `init`)을
+  다시 실행하세요.
+- `… 심볼릭 링크입니다`: 링크를 파일로 바꾸세요.
+- `… 없지만, 이전 bootroot 릴리스의 …이(가) 있습니다`: 오버라이드가 `0.7.0`까지의
+  릴리스가 쓰던 `secrets/` 아래 위치에만 있습니다. 오류의 안내대로 다시 만드세요.
+- `bootroot clean`은 거부된 오버라이드에서 멈추지 않습니다. 그 파일을
+  `docker compose down`에서 빼고 경고한 뒤 `compose-overrides/`를 제거합니다.
 
 ### responder 체크 관련
 
@@ -308,7 +327,7 @@ bootroot service add \
   `bootroot infra up`을 실행하세요.
 - 배포가 한 번도 초기화되지 않았거나, 변경된 바인딩을 기록하려고
   `infra install`을 다시 실행했거나,
-  `secrets/responder/docker-compose.responder.override.yml`이 없다면
+  `compose-overrides/docker-compose.responder.override.yml`이 없다면
   대신 `bootroot init`을 실행하세요.
 - 수동으로 배포한 리스폰더는 `responder.toml`에 실제 `hmac_secret`이
   있어야 합니다.

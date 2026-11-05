@@ -14,7 +14,7 @@ services:
     # entrypoint does not do, and refuses to start if any of them fails.  A
     # named volume mounted at /openbao/raft, a path the image does not have,
     # is created root-owned.  /openbao/audit exists only when the audit
-    # override (secrets/openbao/docker-compose.openbao-audit.yml) bind-mounts
+    # override (compose-overrides/docker-compose.openbao-audit.yml) bind-mounts
     # the registrar endpoint's audit store there and the device writes
     # /openbao/audit/audit.log; without it OpenBao audits to stdout.  The
     # image's docker-entrypoint.sh turns `server` into
@@ -105,7 +105,7 @@ services:
     #   needs no passwd entry for the uid (initdb runs under nss_wrapper).
     #
     # An `entrypoint` discards the image's CMD, so `command` restores it.  The
-    # TLS override (secrets/postgres/docker-compose.postgres-tls.yml) replaces
+    # TLS override (compose-overrides/docker-compose.postgres-tls.yml) replaces
     # that `command` with the server's TLS settings.
     entrypoint: ["sh", "-c", "if [ -z \"$$BOOTROOT_POSTGRES_USER\" ]; then exec docker-entrypoint.sh \"$$@\"; fi; case \"$$BOOTROOT_POSTGRES_USER\" in *:*:* | *[!0-9:]*) echo 'BOOTROOT_POSTGRES_USER is not <uid>:<gid> with two non-zero decimal numbers' >&2; exit 1 ;; *[1-9]*:*[1-9]*) ;; *) echo 'BOOTROOT_POSTGRES_USER is not <uid>:<gid> with two non-zero decimal numbers' >&2; exit 1 ;; esac; uid=\"$${BOOTROOT_POSTGRES_USER%%:*}\"; gid=\"$${BOOTROOT_POSTGRES_USER#*:}\"; find /var/lib/postgresql '(' ! -user \"$$uid\" -o ! -group \"$$gid\" ')' -exec chown -h \"$$uid:$$gid\" {} + || exit 1; exec gosu \"$$uid:$$gid\" docker-entrypoint.sh \"$$@\"", "sh"]
     command: ["postgres"]

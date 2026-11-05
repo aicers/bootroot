@@ -53,6 +53,7 @@ use super::stepca_setup::{
 use crate::cli::args::{InitArgs, InitFeature};
 use crate::cli::output::{print_init_plan, print_init_summary};
 use crate::commands::compose_file::compose_file_dir;
+use crate::commands::compose_overrides::{self, ComposeOverride};
 use crate::commands::compose_project::ComposeIdentity;
 use crate::commands::constants::RESPONDER_SERVICE_NAME;
 use crate::commands::container_name::BootrootContainer;
@@ -68,8 +69,7 @@ use crate::commands::infra::{
 };
 use crate::commands::init::constants::OPENBAO_CONTAINER_PORT;
 use crate::commands::init::{
-    HTTP01_ADMIN_TLS_CERT_REL_PATH, HTTP01_ADMIN_TLS_KEY_REL_PATH,
-    HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_HCL_PATH,
+    HTTP01_ADMIN_TLS_CERT_REL_PATH, HTTP01_ADMIN_TLS_KEY_REL_PATH, OPENBAO_HCL_PATH,
     OPENBAO_TLS_CERT_PATH, OPENBAO_TLS_KEY_PATH, RESPONDER_CONFIG_DIR, RESPONDER_CONFIG_NAME,
 };
 use crate::commands::openbao_unseal::unseal_keys_path;
@@ -464,6 +464,7 @@ async fn prepare_endpoint_and_audit_store_blocking(
     messages: &Messages,
 ) -> Result<(Option<EnabledEndpoint>, Option<std::path::PathBuf>)> {
     let compose_file = args.compose.compose_file.clone();
+    let secrets_dir = args.secrets_dir.secrets_dir.clone();
     let agent_config = args.agent_config.clone();
     let state_path = state_path.to_path_buf();
     let messages = messages.clone();
@@ -471,6 +472,7 @@ async fn prepare_endpoint_and_audit_store_blocking(
         prepare_endpoint_and_audit_store(
             registrar_intent,
             &compose_file,
+            &secrets_dir,
             agent_config.as_deref(),
             &state_path,
             crate::commands::audit_store::production_uid(),
@@ -502,6 +504,7 @@ async fn prepare_endpoint_and_audit_store_blocking(
 fn prepare_endpoint_and_audit_store(
     registrar_intent: Option<registrar_internal::RegistrarInternalIntent>,
     compose_file: &Path,
+    secrets_dir: &Path,
     agent_config: Option<&Path>,
     state_path: &Path,
     expected_uid: u32,
@@ -512,6 +515,7 @@ fn prepare_endpoint_and_audit_store(
     let audit_override = crate::commands::audit_store::apply_audit_store(
         &crate::commands::audit_store::AuditStoreInitInputs {
             compose_file,
+            secrets_dir,
             agent_config,
             state_path,
             endpoint_recorded: registrar_endpoint.is_some(),
@@ -922,8 +926,7 @@ async fn run_init_inner(
     let postgres_tls_enabled = compose_has_postgres(&args.compose.compose_file, messages)?;
     if postgres_tls_enabled {
         issue_postgres_tls_cert(compose_dir, &secrets_dir, rollback.docker(), messages)?;
-        let postgres_tls_override =
-            write_postgres_tls_files(compose_dir, &secrets_dir, messages).await?;
+        let postgres_tls_override = write_postgres_tls_files(compose_dir, messages).await?;
         validate_postgres_tls_override_scope(&postgres_tls_override, messages)?;
         recreate_postgres_with_tls(
             &identity,
@@ -1346,17 +1349,19 @@ async fn run_init_inner(
     // certificate carries.
     let effective_openbao_url = if tls_required {
         let state_path = StateFile::default_path();
-        let override_path = bind_intent.then(|| {
-            compose_dir
-                .join("secrets")
-                .join("openbao")
-                .join(OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME)
-        });
-        if let Some(override_path) = override_path.as_ref()
-            && !override_path.exists()
-        {
-            anyhow::bail!(messages.error_openbao_override_file_missing());
-        }
+        // Read through the checks every override passes before Compose
+        // sees it; one that exists only at its `0.7.0` place stops here.
+        let override_path = if bind_intent {
+            Some(compose_overrides::read_required(
+                compose_dir,
+                &args.secrets_dir.secrets_dir,
+                ComposeOverride::OpenBaoExposed,
+                messages.error_openbao_override_file_missing(),
+                messages,
+            )?)
+        } else {
+            None
+        };
         let mut state = StateFile::load(&state_path)?;
         // A non-loopback install binds where the operator said; an
         // endpoint-enabled loopback install keeps the loopback address
@@ -2152,21 +2157,22 @@ async fn write_state_file_to(
 /// Validates the HTTP-01 exposed compose override before applying it.
 ///
 /// Mirrors the `OpenBao` override validation in the same init flow:
-/// fails early if the override file is missing or its binding does not
-/// match the state-recorded intent.
+/// fails early if the override file is missing, exists only at its
+/// `0.7.0` location, fails the [`compose_overrides::read`] checks, or its
+/// binding does not match the state-recorded intent.
 fn validate_http01_exposed_override_for_init(
     compose_dir: &Path,
     state_path: &Path,
     secrets_dir: &Path,
     messages: &Messages,
 ) -> Result<std::path::PathBuf> {
-    let override_path = compose_dir
-        .join("secrets")
-        .join("responder")
-        .join(HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME);
-    if !override_path.exists() {
-        anyhow::bail!(messages.error_http01_admin_override_file_missing());
-    }
+    let override_path = compose_overrides::read_required(
+        compose_dir,
+        secrets_dir,
+        ComposeOverride::Http01Exposed,
+        messages.error_http01_admin_override_file_missing(),
+        messages,
+    )?;
     let state = StateFile::load(state_path)?;
     let bind_addr = state
         .http01_admin_bind_addr
@@ -2482,6 +2488,7 @@ mod tests {
         let err = prepare_endpoint_and_audit_store(
             Some(intent.clone()),
             &compose_file,
+            &compose_dir.join("secrets"),
             Some(&agent_config),
             &state_path,
             uid,
@@ -2496,6 +2503,7 @@ mod tests {
         let (endpoint, rendered) = prepare_endpoint_and_audit_store(
             Some(intent),
             &compose_file,
+            &compose_dir.join("secrets"),
             Some(&agent_config),
             &state_path,
             uid,

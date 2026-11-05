@@ -1334,7 +1334,8 @@ mod rollback_tests {
         use std::path::PathBuf;
 
         let compose = PathBuf::from("docker-compose.yml");
-        let override_path = PathBuf::from("secrets/responder/override.yml");
+        let override_path =
+            PathBuf::from("compose-overrides/docker-compose.responder.override.yml");
 
         // Simulate fresh install: original is None, override exists.
         let rollback = InitRollback {
@@ -1374,7 +1375,8 @@ mod rollback_tests {
         use std::path::PathBuf;
 
         let compose = PathBuf::from("docker-compose.yml");
-        let override_path = PathBuf::from("secrets/responder/override.yml");
+        let override_path =
+            PathBuf::from("compose-overrides/docker-compose.responder.override.yml");
 
         let rollback = InitRollback {
             responder_config_backup: Some(RollbackFile {
@@ -1412,7 +1414,8 @@ mod rollback_tests {
         use std::path::PathBuf;
 
         let compose = PathBuf::from("docker-compose.yml");
-        let override_path = PathBuf::from("secrets/openbao/agent.override.yml");
+        let override_path =
+            PathBuf::from("compose-overrides/docker-compose.openbao-agent.override.yml");
         let args = rollback_args(&super::rollback_openbao_agent_invocation(
             &default_rollback_identity(),
             &compose,

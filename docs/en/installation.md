@@ -260,8 +260,8 @@ makes an install distinct lives beside it:
   `*_HOST_PORT` entries;
 - `secrets/`, the CA material, rendered config and AppRole credentials that
   step-ca and the OpenBao Agent sidecars bind-mount;
-- the generated overrides (`secrets/openbao/`, `secrets/responder/`) that
-  `bootroot infra install` and `bootroot init` write.
+- the generated overrides in `compose-overrides/` that `bootroot infra install`
+  and `bootroot init` write.
 
 The compose file also resolves `./openbao`, `./secrets` and
 `./responder.toml.compose` relative to its own directory, so a second directory

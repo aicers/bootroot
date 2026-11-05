@@ -4,17 +4,16 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use bootroot::fs_util;
 // Moved to the library so the registrar mint resolves an artifact's
 // `OpenBao` URL by the same rule; re-exported for the CLI's call sites.
 pub(crate) use bootroot::remote_bootstrap::client_url_from_bind_addr;
 use x509_parser::pem::parse_x509_pem;
 
+use crate::commands::compose_overrides::{self, ComposeOverride};
 use crate::commands::container_user::{UserServer, recorded_user};
 use crate::commands::init::{
-    CA_CERTS_DIR, CA_INTERMEDIATE_CERT_FILENAME, CA_ROOT_CERT_FILENAME,
-    HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_HCL_PATH,
-    RESPONDER_CONFIG_DIR, RESPONDER_CONFIG_NAME, STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME,
+    CA_CERTS_DIR, CA_INTERMEDIATE_CERT_FILENAME, CA_ROOT_CERT_FILENAME, OPENBAO_HCL_PATH,
+    RESPONDER_CONFIG_DIR, RESPONDER_CONFIG_NAME,
 };
 use crate::i18n::Messages;
 
@@ -321,73 +320,12 @@ pub(crate) fn reject_http01_admin_advertise_addr_for_specific_bind(
     Ok(())
 }
 
-/// Publishes a generated compose override by rename.
-///
-/// The three exposure overrides below all have the same reader and the
-/// same recovery story, so they share one publish. `docker compose`
-/// parses the file as YAML on every `up`, `ps` and `down`; a truncating
-/// rewrite racing one of those made it fail on a half-written mapping,
-/// which for `down` means a stack that will not come down. A rename
-/// leaves the previous override or the complete new one.
-///
-/// The directory is deliberately **not** flushed. Each of these files is
-/// regenerated verbatim from the bind address in `state.json` by the
-/// command that writes it, so a crash losing the directory entry costs a
-/// re-run of that command rather than anything the operator cannot
-/// reconstruct — and `init` publishes enough of these that a disk round
-/// trip each is worth declining.
-///
-/// The overrides carry a bind address and nothing secret, and `docker
-/// compose` reads them as the invoking operator, so there is no mode to
-/// assert: [`fs_util::StagedMode::PreserveOrUmask`] leaves an existing
-/// override alone and gives a fresh one what the umask would have given
-/// the truncating write this replaced.
-///
-/// The file takes the owner of the directory it lands in, which is the
-/// owner of `secrets/` on a tree nobody re-owned by hand: a root-run
-/// `infra install` otherwise leaves it root's until the next ownership
-/// sweep. It is published through `tree`, so a root process over a
-/// `secrets/` another account owns follows no name on the way, and
-/// refuses a symlink at the override rather than writing through it.
-fn publish_compose_override(
-    tree: &fs_util::SecretsTree,
-    path: &Path,
-    content: &str,
-    messages: &Messages,
-) -> Result<()> {
-    tree.publish(
-        fs_util::Destination::operator_named(path),
-        content.as_bytes(),
-        fs_util::StagedMode::PreserveOrUmask,
-        fs_util::RootedOwner::ContainingDir,
-        fs_util::StagedDurability::RenameOnly,
-    )
-    .with_context(|| messages.error_write_file_failed(&path.display().to_string()))
-}
-
-/// Opens the `secrets/` handle under `compose_dir` and creates the
-/// override directory `name` in it, at `0700` under the owner of the
-/// tree, returning both.
-///
-/// `infra install` creates `compose_dir/secrets` before it renders any
-/// override, so the handle is the tree's; one that does not exist yet
-/// is created here, path-based, by the writer that will own it.
-fn ensure_override_dir(
-    compose_dir: &Path,
-    name: &str,
-    messages: &Messages,
-) -> Result<(fs_util::SecretsTree, PathBuf)> {
-    let secrets_dir = compose_dir.join("secrets");
-    let tree = fs_util::SecretsTree::open(&secrets_dir)
-        .with_context(|| messages.error_write_file_failed(&secrets_dir.display().to_string()))?;
-    let override_dir = secrets_dir.join(name);
-    tree.ensure_dir(&override_dir)
-        .with_context(|| messages.error_write_file_failed(&override_dir.display().to_string()))?;
-    Ok((tree, override_dir))
-}
-
 /// Generates the compose override file that exposes the HTTP-01 admin API
 /// on a non-loopback address.
+///
+/// Published in `<compose dir>/compose-overrides/` through
+/// [`compose_overrides::write`], at `0644` and owned by the writing
+/// process.
 ///
 /// # Errors
 ///
@@ -397,8 +335,6 @@ pub(crate) fn write_http01_exposed_override(
     bind_addr: &str,
     messages: &Messages,
 ) -> Result<PathBuf> {
-    let (tree, override_dir) = ensure_override_dir(compose_dir, "responder", messages)?;
-    let override_path = override_dir.join(HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME);
     let content = format!(
         "\
 services:
@@ -407,8 +343,12 @@ services:
       - \"{bind_addr}:8080\"
 "
     );
-    publish_compose_override(&tree, &override_path, &content, messages)?;
-    Ok(override_path)
+    compose_overrides::write(
+        compose_dir,
+        ComposeOverride::Http01Exposed,
+        &content,
+        messages,
+    )
 }
 
 /// Validates that the HTTP-01 admin compose override port mapping matches
@@ -566,6 +506,10 @@ pub(crate) fn reject_stepca_advertise_addr_for_specific_bind(
 /// Generates the compose override file that exposes step-ca's ACME
 /// directory on a non-loopback address.
 ///
+/// Published in `<compose dir>/compose-overrides/` through
+/// [`compose_overrides::write`], at `0644` and owned by the writing
+/// process.
+///
 /// # Errors
 ///
 /// Returns an error if the override file cannot be written.
@@ -574,8 +518,6 @@ pub(crate) fn write_stepca_exposed_override(
     bind_addr: &str,
     messages: &Messages,
 ) -> Result<PathBuf> {
-    let (tree, override_dir) = ensure_override_dir(compose_dir, "step-ca", messages)?;
-    let override_path = override_dir.join(STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME);
     let content = format!(
         "\
 services:
@@ -584,8 +526,12 @@ services:
       - \"{bind_addr}:9000\"
 "
     );
-    publish_compose_override(&tree, &override_path, &content, messages)?;
-    Ok(override_path)
+    compose_overrides::write(
+        compose_dir,
+        ComposeOverride::StepCaExposed,
+        &content,
+        messages,
+    )
 }
 
 /// Validates that the step-ca compose override port mapping matches the
@@ -1250,6 +1196,10 @@ fn validate_cert_chain_to_stepca_root(secrets_dir: &Path, cert_bytes: &[u8]) -> 
 /// Generates the compose override file that exposes `OpenBao` on a
 /// non-loopback address.
 ///
+/// Published in `<compose dir>/compose-overrides/` through
+/// [`compose_overrides::write`], at `0644` and owned by the writing
+/// process.
+///
 /// The override uses Docker Compose `!override` to replace the base port
 /// mapping with the operator-specified bind address.  `!reset` looks
 /// equivalent at first glance but discards the new value and removes
@@ -1264,8 +1214,6 @@ pub(crate) fn write_openbao_exposed_override(
     bind_addr: &str,
     messages: &Messages,
 ) -> Result<std::path::PathBuf> {
-    let (tree, override_dir) = ensure_override_dir(compose_dir, "openbao", messages)?;
-    let override_path = override_dir.join(OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME);
     let content = format!(
         "\
 services:
@@ -1274,8 +1222,12 @@ services:
       - \"{bind_addr}:8200\"
 "
     );
-    publish_compose_override(&tree, &override_path, &content, messages)?;
-    Ok(override_path)
+    compose_overrides::write(
+        compose_dir,
+        ComposeOverride::OpenBaoExposed,
+        &content,
+        messages,
+    )
 }
 
 /// Validates that the `OpenBao` compose override does not introduce
@@ -2344,47 +2296,39 @@ listener "tcp" {
         assert!(content.contains("!override"));
     }
 
-    /// Each exposure override's directory is created `0700`, and so is
-    /// a `secrets/` the writer had to create on the way, whatever the
-    /// umask would have given them.
+    /// Each exposure override lands in `compose-overrides/`, `0755` over
+    /// a `0644` file, and nothing is created below `secrets/`.
     #[test]
-    fn exposure_override_writers_create_their_directory_0700() {
+    fn exposure_override_writers_publish_into_compose_overrides() {
         use std::os::unix::fs::PermissionsExt;
 
         type Writer = fn(&Path, &str, &Messages) -> Result<PathBuf>;
         let messages = crate::i18n::test_messages();
-        let writers: [(Writer, &str, &str); 3] = [
+        let writers: [(Writer, ComposeOverride, &str); 3] = [
             (
                 write_http01_exposed_override,
-                "responder",
+                ComposeOverride::Http01Exposed,
                 "192.168.1.10:8080",
             ),
             (
                 write_stepca_exposed_override,
-                "step-ca",
+                ComposeOverride::StepCaExposed,
                 "192.168.1.10:9000",
             ),
             (
                 write_openbao_exposed_override,
-                "openbao",
+                ComposeOverride::OpenBaoExposed,
                 "192.168.1.10:8200",
             ),
         ];
-        for (write, name, bind) in writers {
-            for secrets_exists in [false, true] {
-                let dir = tempfile::tempdir().unwrap();
-                let secrets = dir.path().join("secrets");
-                if secrets_exists {
-                    std::fs::create_dir(&secrets).unwrap();
-                    std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o700))
-                        .unwrap();
-                }
-                let path = write(dir.path(), bind, &messages).unwrap();
-                let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-                assert_eq!(path.parent(), Some(secrets.join(name).as_path()));
-                assert_eq!(mode(&secrets.join(name)), 0o700, "{name}");
-                assert_eq!(mode(&secrets), 0o700, "{name}");
-            }
+        for (write, which, bind) in writers {
+            let dir = tempfile::tempdir().unwrap();
+            let path = write(dir.path(), bind, &messages).unwrap();
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(path, compose_overrides::path(dir.path(), which));
+            assert_eq!(mode(&compose_overrides::overrides_dir(dir.path())), 0o755);
+            assert_eq!(mode(&path), 0o644);
+            assert!(!dir.path().join("secrets").exists(), "{which:?}");
         }
     }
 
@@ -3106,9 +3050,8 @@ listener "tcp" {
     fn validate_http01_override_scope_rejects_extra_services() {
         let messages = crate::i18n::test_messages();
         let dir = tempfile::tempdir().unwrap();
-        let override_dir = dir.path().join("secrets").join("responder");
-        std::fs::create_dir_all(&override_dir).unwrap();
-        let path = override_dir.join(HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME);
+        std::fs::create_dir_all(compose_overrides::overrides_dir(dir.path())).unwrap();
+        let path = compose_overrides::path(dir.path(), ComposeOverride::Http01Exposed);
         std::fs::write(
             &path,
             "\
@@ -3256,7 +3199,7 @@ services:
         let path =
             write_stepca_exposed_override(dir.path(), "192.168.1.10:9000", &messages).unwrap();
         assert!(path.exists());
-        assert!(path.ends_with("secrets/step-ca/docker-compose.stepca-exposed.yml"));
+        assert!(path.ends_with("compose-overrides/docker-compose.stepca-exposed.yml"));
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("192.168.1.10:9000:9000"));
         assert!(content.contains("step-ca"));
@@ -3286,9 +3229,8 @@ services:
     fn validate_stepca_override_scope_rejects_guarded_services() {
         let messages = crate::i18n::test_messages();
         let dir = tempfile::tempdir().unwrap();
-        let override_dir = dir.path().join("secrets").join("step-ca");
-        std::fs::create_dir_all(&override_dir).unwrap();
-        let path = override_dir.join(STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME);
+        std::fs::create_dir_all(compose_overrides::overrides_dir(dir.path())).unwrap();
+        let path = compose_overrides::path(dir.path(), ComposeOverride::StepCaExposed);
         std::fs::write(
             &path,
             "\

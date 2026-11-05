@@ -84,10 +84,11 @@ bootroot monitoring status
   connects with `sslmode=verify-full sslrootcert=secrets/certs/root_ca.crt
   host=postgres hostaddr=127.0.0.1 port=<POSTGRES_HOST_PORT>`: the server's
   certificate is valid for the name `postgres` only.
-- The TLS settings live in `secrets/postgres/docker-compose.postgres-tls.yml`
-  and `postgres/pg_hba.conf`, which `bootroot init` writes. Anyone running
+- The TLS settings live in
+  `compose-overrides/docker-compose.postgres-tls.yml` and
+  `postgres/pg_hba.conf`, which `bootroot init` writes. Anyone running
   `docker compose up` on this stack with their own `-f` list must include
-  `secrets/postgres/docker-compose.postgres-tls.yml`, or Compose recreates
+  `compose-overrides/docker-compose.postgres-tls.yml`, or Compose recreates
   PostgreSQL without TLS and step-ca cannot connect. `bootroot infra up`
   includes it; `bootroot infra install`, run again over an initialised
   stack, does not, and `bootroot infra up` afterwards restores it.
@@ -1905,7 +1906,7 @@ would leave the old audit history behind:
 1. Stop the stack.
 2. Relocate the directory to the new path.
 3. Update `[registrar] audit_store_dir` and delete the rendered override
-   at `secrets/openbao/docker-compose.openbao-audit.yml`.
+   at `compose-overrides/docker-compose.openbao-audit.yml`.
 4. Re-run `bootroot init` as root with `--agent-config`.
 
 **Those steps do not carry over to `filesystem` mode**, and this build
@@ -2045,6 +2046,57 @@ requests it cannot audit.
 - Basic triage flow:
   `docker compose ps` -> `docker compose logs --tail=200 <service>`
   -> `bootroot verify --registration-id <service>`.
+
+### Compose overrides beside the compose file
+
+`bootroot infra install` and `bootroot init` write the Compose override files
+they pass to `docker compose -f` into `compose-overrides/`, in the directory of
+the compose file: the exposure overrides of `--openbao-bind`,
+`--http01-admin-bind` and `--stepca-bind`, the responder config override, the
+OpenBao Agent override, the PostgreSQL TLS override and, on a registrar
+endpoint host, the audit override. No container mounts that directory. The
+directory is `0755` and every file in it `0644`, owned by the account that
+wrote it, whatever the umask.
+
+Because bootroot often runs `docker compose` as root, an override decides what
+root starts. Before using one, every command checks:
+
+- that the compose directory is not group- or world-writable (`chmod g-w,o-w`
+  on it fixes a checkout made under umask `002`);
+- that `compose-overrides/` and each file in it are not symbolic links, are
+  owned by a trusted account, and are not group- or world-writable;
+- that `compose-overrides/` is not at or below the secrets directory, which
+  the containers can write.
+
+The trusted accounts are root, the account running the bootroot command, and
+the owner of the compose directory, which can already replace the compose file
+and `.env`. The account that owns `secrets/` is not trusted unless it is one of
+these. bootroot does not check the compose directory's parents: keep them
+writable only by those accounts. A non-root operator can read a root-owned
+`compose-overrides/`, but a command that writes an override there fails with a
+permission error naming the path.
+
+**Upgrading from `0.7.0`.** Releases up to `0.7.0` kept the overrides below
+`secrets/` (`secrets/openbao/`, `secrets/responder/`, `secrets/step-ca/` and
+`secrets/postgres/`). bootroot no longer reads them there, and moves nothing.
+`infra up`, `init` and `reinit` stop with an error naming both paths when an
+override they need exists only at its former place. Recreate it in one of two
+ways:
+
+- re-run `bootroot infra install` with this host's bind options for an
+  exposure override, and `bootroot init --root-token <token>` (after that
+  `infra install` when bind options are in use) for the others, which also
+  re-issues what `init` issues; or
+- review the old file, then copy it as root to the new path at mode `0644`:
+
+  ```bash
+  install -d -m 0755 compose-overrides
+  install -m 0644 secrets/postgres/docker-compose.postgres-tls.yml \
+    compose-overrides/docker-compose.postgres-tls.yml
+  ```
+
+Once the new file exists, the old one is ignored; `bootroot clean` removes it
+with `secrets/`.
 
 ## systemd operations procedure (recommended for bootroot-agent)
 

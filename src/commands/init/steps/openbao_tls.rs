@@ -2549,7 +2549,7 @@ mod tests {
     #[test]
     fn init_tls_rewrite_follows_the_audit_override() {
         let messages = crate::i18n::test_messages();
-        let override_path = Path::new("secrets/openbao/docker-compose.openbao-audit.yml");
+        let override_path = Path::new("compose-overrides/docker-compose.openbao-audit.yml");
         for (audit_override, start, expected) in [
             (
                 Some(override_path),

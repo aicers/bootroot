@@ -10,14 +10,14 @@ use super::openbao_tls::{
     TLS_OUTPUT_MOUNT, TlsKeyHandover, build_tls_key_chown_args, chown_tls_output_dir,
     hand_over_tls_key, reject_symlinked_tls_output_dir,
 };
+use crate::commands::compose_overrides::{self, ComposeOverride};
 use crate::commands::compose_project::{ComposeIdentity, ComposeInvocation};
 use crate::commands::container_user::{ContainerUser, UserServer, recorded_user};
 use crate::commands::infra::{run_compose, run_docker_with_exec};
 use crate::commands::init::{
     CA_CERTS_DIR, CA_INTERMEDIATE_CERT_FILENAME, OPENBAO_TLS_DEFAULT_NOT_AFTER,
     OPENBAO_TLS_DEFAULT_RENEW_BEFORE, POSTGRES_HBA_CONF_PATH, POSTGRES_INFRA_CERT_KEY,
-    POSTGRES_TLS_CERT_PATH, POSTGRES_TLS_COMPOSE_OVERRIDE_DIR, POSTGRES_TLS_COMPOSE_OVERRIDE_NAME,
-    POSTGRES_TLS_DIR, POSTGRES_TLS_KEY_PATH,
+    POSTGRES_TLS_CERT_PATH, POSTGRES_TLS_DIR, POSTGRES_TLS_KEY_PATH,
 };
 use crate::commands::rotate::STEP_CA_HELPER_IMAGE;
 use crate::i18n::Messages;
@@ -386,7 +386,7 @@ pub(in crate::commands::init) fn reconcile_postgres_infra_cert(
 /// that starts `PostgreSQL` with its TLS settings, returning the
 /// override's path.
 ///
-/// The override, `<secrets dir>/postgres/docker-compose.postgres-tls.yml`,
+/// The override, `<compose dir>/compose-overrides/docker-compose.postgres-tls.yml`,
 /// carries the server's command line and mounts the certificate
 /// directory [`issue_postgres_tls_cert`] fills and `pg_hba.conf`, by
 /// absolute host paths. Both files are rewritten on every `init`, and
@@ -398,7 +398,6 @@ pub(in crate::commands::init) fn reconcile_postgres_infra_cert(
 /// either file or the override's directory cannot be written.
 pub(in crate::commands::init) async fn write_postgres_tls_files(
     compose_dir: &Path,
-    secrets_dir: &Path,
     messages: &Messages,
 ) -> Result<PathBuf> {
     let hba_path = compose_dir.join(POSTGRES_HBA_CONF_PATH);
@@ -414,23 +413,15 @@ pub(in crate::commands::init) async fn write_postgres_tls_files(
 
     let compose_root = std::fs::canonicalize(compose_dir)
         .with_context(|| messages.error_resolve_path_failed(&compose_dir.display().to_string()))?;
-    let tree = fs_util::SecretsTree::open_shared(secrets_dir).await?;
-    let override_dir = secrets_dir.join(POSTGRES_TLS_COMPOSE_OVERRIDE_DIR);
-    tree.ensure_dir_async(&override_dir).await?;
-    let override_path = override_dir.join(POSTGRES_TLS_COMPOSE_OVERRIDE_NAME);
-    // The same decisions as the responder override: published by
-    // rename, not flushed, at the destination's mode or the umask's
-    // answer on a create, under the owner of the directory it lands in,
-    // and through the tree handle.
-    tree.publish_async(
-        fs_util::Destination::operator_named(&override_path),
-        postgres_tls_override_contents(&compose_root).as_bytes(),
-        fs_util::StagedMode::PreserveOrUmask,
-        fs_util::RootedOwner::ContainingDir,
-        fs_util::StagedDurability::RenameOnly,
+    // Published in `<compose dir>/compose-overrides/`, outside every
+    // container mount, at `0644` under the writing process.
+    let override_path = compose_overrides::write_async(
+        compose_dir,
+        ComposeOverride::PostgresTls,
+        postgres_tls_override_contents(&compose_root),
+        messages,
     )
-    .await
-    .with_context(|| messages.error_write_file_failed(&override_path.display().to_string()))?;
+    .await?;
 
     println!(
         "{}",
@@ -1358,14 +1349,15 @@ services:
         fs::create_dir_all(&tls_dir).unwrap();
         let messages = test_messages();
 
-        let override_path = write_postgres_tls_files(&compose_dir, &secrets_dir, &messages)
+        let override_path = write_postgres_tls_files(&compose_dir, &messages)
             .await
             .unwrap();
 
         assert_eq!(
             override_path,
-            secrets_dir.join("postgres/docker-compose.postgres-tls.yml")
+            compose_dir.join("compose-overrides/docker-compose.postgres-tls.yml")
         );
+        assert!(!secrets_dir.join("postgres").exists());
         let compose_root = fs::canonicalize(&compose_dir).unwrap();
         assert_eq!(
             fs::read_to_string(&override_path).unwrap(),
@@ -1396,13 +1388,13 @@ host      all  all  all   reject
     #[tokio::test]
     async fn writing_the_files_resets_pg_hba_mode() {
         let dir = tempfile::tempdir().unwrap();
-        let (compose_dir, secrets_dir, tls_dir) = issuance_dirs(dir.path());
+        let (compose_dir, _, tls_dir) = issuance_dirs(dir.path());
         fs::create_dir_all(&tls_dir).unwrap();
         let hba = compose_dir.join("postgres/pg_hba.conf");
         fs::write(&hba, "stale").unwrap();
         fs::set_permissions(&hba, fs::Permissions::from_mode(0o600)).unwrap();
 
-        write_postgres_tls_files(&compose_dir, &secrets_dir, &test_messages())
+        write_postgres_tls_files(&compose_dir, &test_messages())
             .await
             .unwrap();
 
@@ -1418,7 +1410,7 @@ host      all  all  all   reject
         let invocation = postgres_tls_recreate_invocation(
             &identity,
             Path::new("/srv/bootroot/docker-compose.yml"),
-            Path::new("/srv/bootroot/secrets/postgres/docker-compose.postgres-tls.yml"),
+            Path::new("/srv/bootroot/compose-overrides/docker-compose.postgres-tls.yml"),
         );
         let args: Vec<String> = invocation
             .command(&[])
@@ -1432,7 +1424,7 @@ host      all  all  all   reject
                 "-f",
                 "/srv/bootroot/docker-compose.yml",
                 "-f",
-                "/srv/bootroot/secrets/postgres/docker-compose.postgres-tls.yml",
+                "/srv/bootroot/compose-overrides/docker-compose.postgres-tls.yml",
                 "-p",
                 "insight",
                 "up",
