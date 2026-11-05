@@ -309,8 +309,8 @@ which is what proves an operator can — and the re-run must then report
 --path`, that the loaded unit's `Where=` is the configured store, that the
 mount is a loop device whose backing file is the derived image, that the image
 is fully allocated once the mount is up and again after the re-run — the first
-is what an implementation missing `-E nodiscard` fails, the second what one
-missing `-E lazy_itable_init=0` fails, since the kernel's background
+is what a new image left with holes after `mkfs.ext4` fails, the second what
+one missing `-E lazy_itable_init=0` fails, since the kernel's background
 inode-table pass hands those blocks back only seconds after the mount — that
 the store directory and both subdirectories
 carry their contract's owner and mode on the mounted filesystem — the store

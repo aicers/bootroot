@@ -1161,9 +1161,13 @@ assert_the_rendered_steps_activate_the_reserve() {
   # seconds *after* the mount comes up, which the loop driver serves the
   # same way -- so this assertion is deliberately made after the mount
   # is active and the subdirectories are on it, which is the window that
-  # background thread runs in.  Either one missing leaves an image that
-  # passes every size check while the root filesystem is still what
-  # fills.
+  # background thread runs in.  What this assertion fails is a new image
+  # left with holes after `mkfs.ext4` -- by a discard, or by `mke2fs`
+  # punching the regions it zeroes itself -- that the allocation rendered
+  # after `mkfs.ext4` did not refill.  A missing `lazy_itable_init=0` is
+  # what the check after the re-run catches.  Any of those holes leaves
+  # an image that passes every size check while the root filesystem is
+  # still what fills.
   #
   # `>=` rather than `=`, and it is the same comparison the verification
   # itself makes: `st_blocks` counts the *hosting* filesystem's blocks,
