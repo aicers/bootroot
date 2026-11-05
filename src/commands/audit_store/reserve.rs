@@ -148,7 +148,14 @@ const RESERVE_FS_TYPE: &str = "ext4";
 /// mebibyte on the 16 MiB floor, and tens of mebibytes on the shipped
 /// 2 GiB default, none of which the kernel is holding either writer to
 /// any more. Writing the tables at `mkfs` time costs one pass over
-/// them once and makes the allocation final.
+/// them once.
+///
+/// Together the two options stop the discard and the background
+/// inode-table zeroing. Neither covers the zeroing `mke2fs` does
+/// itself on a regular file — its journal, its inode tables and the
+/// wipe at the end of the device — which it may serve by punching the
+/// file where the hosting filesystem supports no zero-range; the
+/// allocation `image_commands` renders after `mkfs` covers that.
 const MKFS_EXTENDED_OPTIONS: &str = "nodiscard,lazy_itable_init=0";
 
 /// The prefix every loop device node carries.
@@ -1845,6 +1852,19 @@ fn evaluate_openbao_dir(facts: Option<FileFacts>) -> SubdirState {
 /// hole while preserving the filesystem and records already present.
 /// When the proved reserve is mounted, the `dd` route first unmounts it:
 /// the backing file must be offline while it is rewritten.
+///
+/// A new image is allocated twice: once before `mkfs.ext4`, which gives
+/// the file its length and is the only allocation that does any work on
+/// most hosts, and again after it, through the same in-place route the
+/// sparse remedy uses. On a regular file `mke2fs` zeroes its journal,
+/// its inode tables and the end of the device, and where the hosting
+/// filesystem has no zero-range it does so by punching holes, giving
+/// back blocks the first allocation reserved. The second allocation
+/// fills those holes with blocks that read as zeroes, which is what
+/// `mke2fs` meant them to hold, so the filesystem it wrote is unchanged.
+/// Its `dd` route needs no unmount: activation, the only thing that
+/// mounts the image or attaches it to a loop device, is a later step,
+/// so nothing else writes the image while it is rewritten.
 fn image_commands(inputs: &ReserveInputs<'_>, facts: &Phase1Facts) -> Vec<String> {
     let image = sh_quote_path(&facts.image_path);
     match facts.image {
@@ -1856,6 +1876,11 @@ fn image_commands(inputs: &ReserveInputs<'_>, facts: &Phase1Facts) -> Vec<String
                 &zero_fill_allocation_command(inputs.reserve_bytes, &image),
             ),
             format!("mkfs.ext4 -m 0 -E {MKFS_EXTENDED_OPTIONS} {image}"),
+            allocation_command(
+                inputs.reserve_bytes,
+                &image,
+                &preserve_existing_allocation_command(&image),
+            ),
         ],
         ImageEvaluation::Correct => Vec::new(),
         ImageEvaluation::Deviating {
@@ -3368,13 +3393,19 @@ mod tests {
         let chmod = format!("chmod 0600 '{IMAGE}'");
 
         // Absent: the only row that creates, allocates to the full
-        // length or formats.
+        // length or formats — and then allocates again in place, since
+        // `mke2fs` may punch the regions it zeroes.
         let absent = bare_host();
         let facts = evaluate(&inputs, &absent, &messages).expect("phase 1");
         assert_eq!(facts.image, ImageEvaluation::Absent);
         assert_eq!(
             image_commands(&inputs, &facts),
-            vec![install.clone(), absent_allocate, mkfs.clone()]
+            vec![
+                install.clone(),
+                absent_allocate,
+                mkfs.clone(),
+                sparse_allocate.clone()
+            ]
         );
 
         // Wrong file type: a hard error with no image command at all.

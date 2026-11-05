@@ -1156,7 +1156,12 @@ filesystem underneath it once activation looked complete: a little over
 a mebibyte at the 16 MiB floor, tens of mebibytes on the shipped 2 GiB
 default, and none of it still held by the kernel against either writer.
 Writing the tables at `mkfs` time costs one pass over them once and
-makes the allocation final.
+makes the allocation final. A new image is nonetheless allocated a second
+time after `mkfs.ext4`, because on some hosting filesystems `mke2fs`
+zeroes its journal and inode tables by punching holes, handing back blocks
+the first allocation reserved. The second allocation fills only those
+holes, with blocks that read as the zeroes `mke2fs` meant them to hold, so
+it keeps the filesystem `mkfs` wrote.
 
 **Re-provisioning is idempotent and never reformats.** A second run
 compares the image against the whole contract — a regular file at the
@@ -1773,14 +1778,18 @@ passes that change nothing on the host.
 3. Create the new image at `<audit_store_dir>.img.new` — the same parent
    directory, so the closing rename is atomic within one filesystem — at
    the new size, fully allocated, uid 0, mode `0600`, and
-   `mkfs.ext4 -m 0 -E nodiscard,lazy_itable_init=0` it. The free space
-   needed is the **new image's full size**: the old image's bytes are not
-   reclaimed until step 6.
+   `mkfs.ext4 -m 0 -E nodiscard,lazy_itable_init=0` it. Then allocate it
+   again: on some hosting filesystems `mke2fs` zeroes its journal and
+   inode tables by punching holes, and the second `fallocate` fills them
+   without changing the filesystem `mkfs` wrote. The free space needed is
+   the **new image's full size**: the old image's bytes are not reclaimed
+   until step 6.
 
    ```sh
    install -m 0600 /dev/null <audit_store_dir>.img.new
    fallocate -l <new size> <audit_store_dir>.img.new
    mkfs.ext4 -m 0 -E nodiscard,lazy_itable_init=0 <audit_store_dir>.img.new
+   fallocate -l <new size> <audit_store_dir>.img.new
    ```
 
 4. Mount the new image at a temporary mount point, then run the
