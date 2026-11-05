@@ -54,6 +54,8 @@ cd "$ROOT_DIR"
 
 # shellcheck source=lib/leftovers.sh
 . "$SCRIPT_DIR/lib/leftovers.sh"
+# shellcheck source=lib/mount-check.sh
+. "$SCRIPT_DIR/lib/mount-check.sh"
 
 ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/tmp/e2e/docker-secrets-owner-$(date +%s)}"
 mkdir -p "$ARTIFACT_DIR"
@@ -743,8 +745,10 @@ container_mounts() {
 
 # The account plants a file at the `0.7.0` place of each of the seven
 # overrides, as it could on a released install, and root then runs
-# `infra up`.  None of them may be read: the run succeeds, and no
-# container ends up privileged or carrying a mount it did not have.
+# `infra up`.  None of them may be read: the run succeeds, no container
+# ends up privileged or mounting the planted `/:/host`, and no container
+# carries a mount it did not have before, compared container by
+# container by name (`mounts_gained`), since `infra up` recreates them.
 assert_legacy_overrides_ignored() {
   log_phase "legacy-overrides"
   local before="$ARTIFACT_DIR/containers-before.txt" after="$ARTIFACT_DIR/containers-after.txt"
@@ -787,9 +791,10 @@ assert_legacy_overrides_ignored() {
     fail "a container mounts a planted volume after infra up; see $after"
   fi
   local added
-  added="$(comm -13 <(grep '^  ' "$before" | sort -u) <(grep '^  ' "$after" | sort -u))"
+  added="$(mounts_gained "$before" "$after")" \
+    || fail "could not compare the mounts in $before and $after"
   [ -z "$added" ] \
-    || fail "infra up added mounts no container had before: ${added//$'\n'/; }"
+    || fail "infra up gave containers mounts they did not have before: ${added//$'\n'/; }"
 }
 
 # `bootroot status` fails when any core container is missing or

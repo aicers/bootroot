@@ -1116,6 +1116,7 @@ CI 워크플로 동등 스크립트(`scripts/preflight/ci/`):
 | `scripts/validate-e2e-openssl-compat.sh` | `ci.yml` → Validate E2E OpenSSL Compatibility |
 | `scripts/validate-e2e-leftover-check.sh` | `ci.yml` → Validate E2E Leftover Check |
 | `scripts/validate-e2e-run-scope.sh` | `ci.yml` → Validate E2E Run Scope |
+| `scripts/validate-e2e-mount-check.sh` | `ci.yml` → Validate E2E Mount Check |
 | `scripts/preflight/ci/deploy-no-build-smoke.sh` | `ci.yml` → Deploy Compose No-Build Smoke |
 | `scripts/preflight/ci/test-core.sh` | `ci.yml` → test-core |
 | `scripts/preflight/ci/e2e-matrix.sh` | `ci.yml` → test-docker-e2e-matrix |
