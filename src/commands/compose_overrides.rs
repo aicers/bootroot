@@ -581,8 +581,8 @@ fn is_trusted_owner(uid: u32, euid: u32, compose_owner: u32) -> bool {
 /// [`read`] applies it to every override; a command that writes
 /// overrides calls it before its first write, so an override it
 /// publishes and hands Compose in the same run is never inside the tree
-/// the containers mount. A secrets directory that does not exist holds
-/// nothing.
+/// the containers mount. A secrets directory that does not exist yet is
+/// compared as the path it will have once created.
 ///
 /// # Errors
 ///
@@ -600,15 +600,8 @@ pub(crate) fn refuse_inside_secrets(
     let canonical_dir = std::fs::canonicalize(openable(compose_dir))
         .with_context(|| messages.error_resolve_path_failed(&compose_dir.display().to_string()))?
         .join(COMPOSE_OVERRIDES_DIR);
-    let canonical_secrets = match std::fs::canonicalize(secrets_dir) {
-        Ok(path) => path,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => {
-            return Err(err).with_context(|| {
-                messages.error_resolve_path_failed(&secrets_dir.display().to_string())
-            });
-        }
-    };
+    let canonical_secrets = canonicalize_prospective(secrets_dir)
+        .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
     let inside = fs_util::path_is_within(&canonical_dir, &canonical_secrets)
         .with_context(|| messages.error_resolve_path_failed(&display))?;
     if inside {
@@ -618,6 +611,41 @@ pub(crate) fn refuse_inside_secrets(
         ));
     }
     Ok(())
+}
+
+/// Resolves `path` as it will be once created: its deepest existing
+/// ancestor canonically, with the components below it appended and
+/// normalized lexically.
+///
+/// A secrets directory that a command creates later must be compared as
+/// that directory, or naming `compose-overrides/` itself before it
+/// exists would pass and the command would then create the secrets tree
+/// there.
+fn canonicalize_prospective(path: &Path) -> std::io::Result<PathBuf> {
+    for ancestor in path.ancestors() {
+        let existing = if ancestor.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            ancestor
+        };
+        match std::fs::canonicalize(existing) {
+            Ok(canonical) => {
+                let rest = path
+                    .strip_prefix(ancestor)
+                    .expect("every ancestor of a path is a prefix of it");
+                return fs_util::absolute_lexical(&canonical.join(rest));
+            }
+            // A dangling link is not absent: where it leads is not known
+            // until something creates its target.
+            Err(err)
+                if err.kind() == std::io::ErrorKind::NotFound
+                    && std::fs::symlink_metadata(existing).is_err() => {}
+            Err(err) => return Err(err),
+        }
+    }
+    // Only a relative path's last ancestor is empty, and `.` exists; an
+    // absolute path ends at `/`. Either resolves above.
+    Err(std::io::Error::from(std::io::ErrorKind::NotFound))
 }
 
 /// Answers for an override missing from `compose-overrides/`: `None`,
@@ -1135,6 +1163,37 @@ mod tests {
         refuse_inside_secrets(dir.path(), &secrets_of(dir.path()), &messages).unwrap();
         std::fs::create_dir(secrets_of(dir.path())).unwrap();
         refuse_inside_secrets(dir.path(), &secrets_of(dir.path()), &messages).unwrap();
+        // A secrets directory that does not exist yet is compared as
+        // the path it will have: `compose-overrides/` itself, before
+        // either exists, is refused, as is an absent parent of it.
+        let absent = dir.path().join("absent");
+        for secrets in [
+            overrides_dir(dir.path()),
+            absent.join("..").join(COMPOSE_OVERRIDES_DIR),
+        ] {
+            let err = refuse_inside_secrets(dir.path(), &secrets, &messages).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                messages.error_compose_override_inside_secrets(
+                    &overrides_dir(dir.path()).display().to_string(),
+                    &std::fs::canonicalize(dir.path())
+                        .unwrap()
+                        .join(COMPOSE_OVERRIDES_DIR)
+                        .display()
+                        .to_string()
+                )
+            );
+        }
+        assert!(!overrides_dir(dir.path()).exists());
+        // Nor is a dangling link resolved as if it were absent.
+        let dangling = dir.path().join("dangling");
+        symlink(overrides_dir(dir.path()), &dangling).unwrap();
+        let err = refuse_inside_secrets(dir.path(), &dangling, &messages).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            messages.error_resolve_path_failed(&dangling.display().to_string())
+        );
+        std::fs::remove_file(&dangling).unwrap();
         // A secrets directory below `compose-overrides/` itself is not
         // its parent.
         refuse_inside_secrets(
