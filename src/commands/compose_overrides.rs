@@ -29,7 +29,7 @@
 //! override that exists only there stops and says how to recreate it.
 
 use std::os::fd::OwnedFd;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
 use bootroot::fs_util;
@@ -613,39 +613,48 @@ pub(crate) fn refuse_inside_secrets(
     Ok(())
 }
 
-/// Resolves `path` as it will be once created: its deepest existing
-/// ancestor canonically, with the components below it appended and
-/// normalized lexically.
+/// Resolves `path` as it will be once created, one component at a time.
 ///
 /// A secrets directory that a command creates later must be compared as
 /// that directory, or naming `compose-overrides/` itself before it
 /// exists would pass and the command would then create the secrets tree
-/// there.
+/// there. Each component is resolved the way the kernel will resolve it
+/// once the missing ones exist as real directories: an existing entry,
+/// link or not, canonically; a missing one appended as is; and `..` by
+/// dropping the last component of the physical path built so far. So a
+/// link reached after `..` (`absent/../alias`) is followed, not taken
+/// lexically.
 fn canonicalize_prospective(path: &Path) -> std::io::Result<PathBuf> {
-    for ancestor in path.ancestors() {
-        let existing = if ancestor.as_os_str().is_empty() {
-            Path::new(".")
-        } else {
-            ancestor
-        };
-        match std::fs::canonicalize(existing) {
-            Ok(canonical) => {
-                let rest = path
-                    .strip_prefix(ancestor)
-                    .expect("every ancestor of a path is a prefix of it");
-                return fs_util::absolute_lexical(&canonical.join(rest));
+    let mut resolved = if path.has_root() {
+        PathBuf::from("/")
+    } else {
+        std::fs::canonicalize(".")?
+    };
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+            // `resolved` is physical throughout, so dropping its last
+            // component is where the kernel's `..` leads. At `/`, `..`
+            // is `/` again.
+            Component::ParentDir => {
+                resolved.pop();
             }
-            // A dangling link is not absent: where it leads is not known
-            // until something creates its target.
-            Err(err)
-                if err.kind() == std::io::ErrorKind::NotFound
-                    && std::fs::symlink_metadata(existing).is_err() => {}
-            Err(err) => return Err(err),
+            Component::Normal(name) => {
+                let candidate = resolved.join(name);
+                match std::fs::symlink_metadata(&candidate) {
+                    // A dangling link is not absent: where it leads is
+                    // not known until something creates its target, so
+                    // its `NotFound` is returned.
+                    Ok(_) => resolved = std::fs::canonicalize(&candidate)?,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        resolved = candidate;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
         }
     }
-    // Only a relative path's last ancestor is empty, and `.` exists; an
-    // absolute path ends at `/`. Either resolves above.
-    Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+    Ok(resolved)
 }
 
 /// Answers for an override missing from `compose-overrides/`: `None`,
@@ -1194,6 +1203,39 @@ mod tests {
             messages.error_resolve_path_failed(&dangling.display().to_string())
         );
         std::fs::remove_file(&dangling).unwrap();
+        // A link reached through `..` after a missing component is
+        // followed: `absent/../alias`, with `alias` leading to the
+        // compose directory, is created as the compose directory.
+        let alias = dir.path().join("alias");
+        symlink(dir.path(), &alias).unwrap();
+        let through_alias = absent.join("..").join("alias");
+        let err = refuse_inside_secrets(dir.path(), &through_alias, &messages).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            messages.error_compose_override_inside_secrets(
+                &overrides_dir(dir.path()).display().to_string(),
+                &std::fs::canonicalize(dir.path())
+                    .unwrap()
+                    .display()
+                    .to_string()
+            )
+        );
+        // As is one reached further below a missing component.
+        let deeper = absent
+            .join("x")
+            .join("..")
+            .join("..")
+            .join("alias")
+            .join(COMPOSE_OVERRIDES_DIR);
+        refuse_inside_secrets(dir.path(), &deeper, &messages).unwrap_err();
+        // What the check compares is where creating the path leads.
+        std::fs::create_dir_all(&through_alias).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&through_alias).unwrap(),
+            std::fs::canonicalize(dir.path()).unwrap()
+        );
+        std::fs::remove_dir(&absent).unwrap();
+        std::fs::remove_file(&alias).unwrap();
         // A secrets directory below `compose-overrides/` itself is not
         // its parent.
         refuse_inside_secrets(
