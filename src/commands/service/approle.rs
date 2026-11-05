@@ -149,8 +149,10 @@ pub(super) async fn write_role_id_file(
 /// final-component symlink.
 ///
 /// On a rooted `tree` the default location is written through the
-/// handle: the directory is created writer-owned at `0700` and the file
-/// published as `atomic_write` publishes it, following no name.
+/// handle, following no name: each missing directory level is created at
+/// `0700` under the owner of the level it is created in, and the file is
+/// published at `0600` under the owner of the file it replaces or, when
+/// fresh, of its directory.
 async fn write_service_credential_file(
     tree: &Arc<SecretsTree>,
     path: &Path,
@@ -192,9 +194,11 @@ async fn write_service_credential_file(
 }
 
 /// Publishes `contents` at `path` below the secrets directory through a
-/// rooted `tree`, as `ensure_secrets_dir` and `atomic_write` do by path:
-/// the parent created writer-owned at `0700`, the file at `0600` under
-/// the owner of the file it replaces, and the directory flushed.
+/// rooted `tree`, as `ensure_secrets_dir` and `atomic_write` do by path,
+/// except for owners: each directory level it creates is `0700` under the
+/// owner of the level it is created in, the file is `0600` under the
+/// owner of the file it replaces or, when fresh, of the directory it
+/// lands in, and the directory is flushed.
 pub(super) async fn publish_below_secrets(
     tree: &Arc<SecretsTree>,
     path: &Path,
@@ -206,13 +210,13 @@ pub(super) async fn publish_below_secrets(
     let failed = messages.error_write_file_failed(&path.display().to_string());
     tree.run(move |tree| {
         if let Some(parent) = target.parent() {
-            tree.ensure_dir_as_writer(parent)?;
+            tree.ensure_dir(parent)?;
         }
         tree.publish(
             fs_util::Destination::bootroot_owned(&target),
             &payload,
             fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
-            RootedOwner::Destination,
+            RootedOwner::DestinationOrContainingDir,
             fs_util::StagedDurability::FlushDirectory,
         )
         .context(failed)
@@ -223,6 +227,7 @@ pub(super) async fn publish_below_secrets(
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
 
     use tempfile::tempdir;
 
@@ -381,5 +386,109 @@ mod tests {
             }
         }
         assert_eq!(results[0], results[1]);
+    }
+
+    /// The directories and files a rooted `publish_below_secrets` creates
+    /// for a remote-bootstrap `service add`, below a `secrets/` with no
+    /// `services/` or `remote-bootstrap/` yet.
+    fn remote_bootstrap_entries(secrets: &Path) -> (Vec<(PathBuf, &'static str)>, [PathBuf; 3]) {
+        let services = secrets.join("services");
+        let service_dir = services.join("svc");
+        let bootstrap = secrets.join("remote-bootstrap");
+        let bootstrap_services = bootstrap.join("services");
+        let bootstrap_dir = bootstrap_services.join("svc");
+        let files = [
+            service_dir.join("role_id"),
+            service_dir.join("secret_id"),
+            bootstrap_dir.join("bootstrap.json"),
+        ];
+        let dirs = vec![
+            (services, "services/"),
+            (service_dir, "services/svc/"),
+            (bootstrap, "remote-bootstrap/"),
+            (bootstrap_services, "remote-bootstrap/services/"),
+            (bootstrap_dir, "remote-bootstrap/services/svc/"),
+        ];
+        (dirs, files)
+    }
+
+    async fn publish_remote_bootstrap_entries(tree: &Arc<SecretsTree>, files: &[PathBuf; 3]) {
+        let messages = crate::i18n::test_messages();
+        for file in files {
+            publish_below_secrets(tree, file, b"payload", &messages)
+                .await
+                .expect("publish below secrets");
+        }
+    }
+
+    /// On a rooted handle every level `publish_below_secrets` creates
+    /// takes the owner of the level it is created in, and every fresh
+    /// file its directory's. `secrets/` takes a supplementary gid so the
+    /// directory's group and the writer's differ on Linux, where a fresh
+    /// entry takes the writer's primary gid; on macOS a fresh entry
+    /// inherits its directory's group anyway. A replaced file keeps the
+    /// writer's egid. Single-gid runners skip.
+    #[tokio::test]
+    async fn rooted_publish_below_secrets_gives_created_entries_the_directory_group() {
+        let Some(gid) = bootroot::cert_group::one_supplementary_test_gid() else {
+            return;
+        };
+        let root = crate::test_support::SwapRoot::new();
+        std::os::unix::fs::chown(&root.secrets, None, Some(gid))
+            .expect("test process must be able to chgrp to a supplementary gid");
+        let owner = (fs_util::current_process_euid(), gid);
+        let tree = Arc::new(root.rooted());
+        let (dirs, files) = remote_bootstrap_entries(&root.secrets);
+
+        publish_remote_bootstrap_entries(&tree, &files).await;
+
+        for (dir, label) in &dirs {
+            crate::test_support::assert_owner_and_mode(dir, owner, 0o700, label);
+        }
+        for file in &files {
+            crate::test_support::assert_owner_and_mode(file, owner, 0o600, "a published file");
+        }
+
+        let egid = bootroot::cert_group::current_process_egid();
+        let [_, secret_id, _] = &files;
+        std::os::unix::fs::chown(secret_id, None, Some(egid)).expect("chgrp secret_id");
+        publish_below_secrets(&tree, secret_id, b"replaced", &crate::i18n::test_messages())
+            .await
+            .expect("republish secret_id");
+        crate::test_support::assert_owner_and_mode(
+            secret_id,
+            (owner.0, egid),
+            0o600,
+            "the replaced secret_id",
+        );
+    }
+
+    /// As root over a `secrets/` another account owns, with no
+    /// `services/` or `remote-bootstrap/` yet, the credentials and the
+    /// bootstrap artifact a remote-bootstrap `service add` publishes,
+    /// and every directory level above them, are owned by the uid and
+    /// gid of `secrets/`: directories `0700`, files `0600`.
+    #[tokio::test]
+    async fn publish_below_secrets_gives_created_entries_the_secrets_owner_as_root_only() {
+        use crate::test_support::{FOREIGN_OWNER, assert_owner_and_mode};
+
+        if !crate::test_support::running_as_root_or_required() {
+            return;
+        }
+        let foreign = (FOREIGN_OWNER, FOREIGN_OWNER);
+        let dir = tempdir().unwrap();
+        let secrets = crate::test_support::foreign_owned_secrets(dir.path());
+        let tree = Arc::new(SecretsTree::open(&secrets).unwrap());
+        assert!(tree.is_rooted(), "root over a foreign-owned tree is rooted");
+        let (dirs, files) = remote_bootstrap_entries(&secrets);
+
+        publish_remote_bootstrap_entries(&tree, &files).await;
+
+        for (dir, label) in &dirs {
+            assert_owner_and_mode(dir, foreign, 0o700, label);
+        }
+        for file in &files {
+            assert_owner_and_mode(file, foreign, 0o600, "a published file");
+        }
     }
 }

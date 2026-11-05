@@ -216,8 +216,10 @@ pub(super) async fn write_remote_bootstrap_artifact_from_entry(
 
 ///
 /// On a rooted `tree` the directory and the artifact go through the
-/// handle: the directories are created writer-owned at `0700` and the
-/// artifact published as `atomic_write` publishes it, following no name.
+/// handle, following no name: each missing directory level is created at
+/// `0700` under the owner of the level it is created in, and the artifact
+/// is published at `0600` under the owner of the file it replaces or,
+/// when fresh, of its directory.
 async fn write_remote_bootstrap_artifact_file(
     tree: &Arc<SecretsTree>,
     registration_id: &str,

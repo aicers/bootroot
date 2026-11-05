@@ -1160,8 +1160,10 @@ async fn ensure_role_id_file(
 /// The recorded path is rebased onto the anchor, and the leaf is read
 /// without following it: any existing entry but a symbolic link returns
 /// early, as `exists()` does, while an absent leaf or a link is written
-/// (the publish replaces a link). The directory is created writer-owned
-/// and the file published as the path-based branch does by name.
+/// (the publish replaces a link). Each missing directory level is created
+/// under the owner of the level it is created in, and the file is
+/// published under the owner of the directory it lands in (or of a
+/// regular file at the name, which this writer never replaces).
 async fn ensure_role_id_file_rooted(
     entry: &ServiceEntry,
     tree: &Arc<SecretsTree>,
@@ -1186,12 +1188,12 @@ async fn ensure_role_id_file_rooted(
     let target = role_id_path.clone();
     let failed = messages.error_write_file_failed(&role_id_path.display().to_string());
     tree.run(move |tree| {
-        tree.ensure_dir_as_writer(&service_dir)?;
+        tree.ensure_dir(&service_dir)?;
         tree.publish(
             fs_util::Destination::bootroot_owned(&target),
             role_id.as_bytes(),
             fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
-            RootedOwner::Destination,
+            RootedOwner::DestinationOrContainingDir,
             fs_util::StagedDurability::FlushDirectory,
         )
         .context(failed)
@@ -3327,6 +3329,80 @@ mod tests {
         .expect_err("a link at services/ is refused");
         crate::test_support::assert_error_names(&err, &link);
         assert_eq!(root.outside_snapshot(), before);
+    }
+
+    /// On a rooted handle the levels `ensure_role_id_file` creates for a
+    /// local-file service take the owner of the level they are created
+    /// in, and the fresh `role_id` its directory's. `secrets/` takes a
+    /// supplementary gid so the directory's group and the writer's
+    /// differ on Linux, where a fresh entry takes the writer's primary
+    /// gid; on macOS a fresh entry inherits its directory's group anyway.
+    /// Single-gid runners skip.
+    #[tokio::test]
+    async fn rooted_role_id_recovery_gives_created_entries_the_directory_group() {
+        let Some(gid) = bootroot::cert_group::one_supplementary_test_gid() else {
+            return;
+        };
+        let root = crate::test_support::SwapRoot::new();
+        std::os::unix::fs::chown(&root.secrets, None, Some(gid))
+            .expect("test process must be able to chgrp to a supplementary gid");
+        let owner = (bootroot::fs_util::current_process_euid(), gid);
+        let tree = rooted_arc(&root);
+        let server = role_id_server(&service_role_name("svc")).await;
+        let services = root.secrets.join("services");
+        let service_dir = services.join("svc");
+        let mut entry = make_service_entry(root.root(), "svc", DeliveryMode::LocalFile);
+        entry.approle.secret_id_path = service_dir.join("secret_id");
+
+        ensure_role_id_file(
+            &entry,
+            &root.secrets,
+            &tree,
+            &scoped_client(&server),
+            &test_messages(),
+        )
+        .await
+        .expect("role_id recovery");
+
+        let role_id = service_dir.join(ROLE_ID_FILENAME);
+        crate::test_support::assert_owner_and_mode(&services, owner, 0o700, "services/");
+        crate::test_support::assert_owner_and_mode(&service_dir, owner, 0o700, "services/svc/");
+        crate::test_support::assert_owner_and_mode(&role_id, owner, 0o600, "role_id");
+        assert_eq!(fs::read_to_string(&role_id).expect("read"), "svc-role-id");
+    }
+
+    /// As root over a `secrets/` another account owns, the `role_id` a
+    /// rooted recovery backfills for a local-file service, and the
+    /// `services/` and `services/<registration>/` levels it creates, are
+    /// owned by the uid and gid of `secrets/`: directories `0700`, the
+    /// file `0600`.
+    #[tokio::test]
+    async fn ensure_role_id_file_gives_created_entries_the_secrets_owner_as_root_only() {
+        use crate::test_support::{FOREIGN_OWNER, assert_owner_and_mode};
+
+        if !crate::test_support::running_as_root_or_required() {
+            return;
+        }
+        let foreign = (FOREIGN_OWNER, FOREIGN_OWNER);
+        let dir = tempdir().expect("tempdir");
+        let secrets = crate::test_support::foreign_owned_secrets(dir.path());
+        let tree = Arc::new(SecretsTree::open(&secrets).expect("open handle"));
+        assert!(tree.is_rooted(), "root over a foreign-owned tree is rooted");
+        let server = role_id_server(&service_role_name("svc")).await;
+        let services = secrets.join("services");
+        let service_dir = services.join("svc");
+        let mut entry = make_service_entry(dir.path(), "svc", DeliveryMode::LocalFile);
+        entry.approle.secret_id_path = service_dir.join("secret_id");
+
+        ensure_role_id_file_rooted(&entry, &tree, &scoped_client(&server), &test_messages())
+            .await
+            .expect("role_id recovery");
+
+        let role_id = service_dir.join(ROLE_ID_FILENAME);
+        assert_owner_and_mode(&services, foreign, 0o700, "services/");
+        assert_owner_and_mode(&service_dir, foreign, 0o700, "services/svc/");
+        assert_owner_and_mode(&role_id, foreign, 0o600, "role_id");
+        assert_eq!(fs::read_to_string(&role_id).expect("read"), "svc-role-id");
     }
 
     /// A rooted handle leaves an override exactly as the path-based run

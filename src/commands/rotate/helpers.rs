@@ -114,8 +114,10 @@ pub(super) async fn write_secret_file(
 /// kill the fast-poll loop on its next re-login.
 ///
 /// `path` lies below the secrets directory `tree` is opened on. On a
-/// rooted handle the parent is created writer-owned through the handle
-/// and the file is published through it, following no name; otherwise
+/// rooted handle the parent is created through the handle, each missing
+/// level under the owner of the level it is created in, and the file is
+/// published through it, following no name: a replaced file keeps its
+/// owner, and a fresh one takes the owner of its directory. Otherwise
 /// this is [`write_secret_id_atomic_by_path`].
 pub(super) async fn write_secret_id_atomic(
     tree: &Arc<SecretsTree>,
@@ -127,7 +129,14 @@ pub(super) async fn write_secret_id_atomic(
         return write_secret_id_atomic_by_path(path, value, messages).await;
     }
     secret_id_parent(path, messages)?;
-    publish_secret_rooted(tree, path, value, RootedOwner::Destination, messages).await
+    publish_secret_rooted(
+        tree,
+        path,
+        value,
+        RootedOwner::DestinationOrContainingDir,
+        messages,
+    )
+    .await
 }
 
 /// [`write_secret_id_atomic`]'s path-based write, for a handle that is
@@ -163,11 +172,11 @@ fn secret_id_parent<'p>(path: &'p Path, messages: &Messages) -> Result<&'p Path>
 }
 
 /// The rooted half of [`write_secret_file`] and
-/// [`write_secret_id_atomic`]: the parent is created writer-owned at
-/// `0700` as `ensure_secrets_dir` creates it, and the file is published
-/// through the handle at `0600` with the directory flushed, as
-/// `atomic_write` publishes it. The caller chooses the owner: `owner`
-/// is established on the staged temporary before the rename.
+/// [`write_secret_id_atomic`]: each missing directory level is created at
+/// `0700` under the owner of the level it is created in, and the file is
+/// published through the handle at `0600` with the directory flushed, as
+/// `atomic_write` publishes it. The caller chooses the file's owner:
+/// `owner` is established on the staged temporary before the rename.
 async fn publish_secret_rooted(
     tree: &Arc<SecretsTree>,
     path: &Path,
@@ -180,7 +189,7 @@ async fn publish_secret_rooted(
     let failed = messages.error_write_file_failed(&path.display().to_string());
     tree.run(move |tree| {
         if let Some(parent) = target.parent() {
-            tree.ensure_dir_as_writer(parent)?;
+            tree.ensure_dir(parent)?;
         }
         tree.publish(
             fs_util::Destination::bootroot_owned(&target),
@@ -843,21 +852,6 @@ mod tests {
         assert_eq!(std::fs::read(&secret_id).expect("read"), b"new");
     }
 
-    /// Whether a root-only test should run: it runs as root, and fails
-    /// rather than skips when `BOOTROOT_E2E_REQUIRE_CERT_OWNER=1` asks
-    /// for it and the process is not root, so a CI step that meant to
-    /// run it as root cannot pass by skipping it.
-    fn running_as_root_or_required() -> bool {
-        if bootroot::fs_util::current_process_euid() == 0 {
-            return true;
-        }
-        assert!(
-            std::env::var_os("BOOTROOT_E2E_REQUIRE_CERT_OWNER").is_none_or(|value| value != "1"),
-            "BOOTROOT_E2E_REQUIRE_CERT_OWNER=1 requires this test to run as root"
-        );
-        false
-    }
-
     /// As root over a `secrets/` another account owns, the handle is
     /// rooted and the staged step-ca password replaces a root-owned
     /// leftover with a file owned by the uid and gid of `secrets/` at
@@ -868,7 +862,7 @@ mod tests {
 
         const OWNER: u32 = 65_534;
 
-        if !running_as_root_or_required() {
+        if !crate::test_support::running_as_root_or_required() {
             return;
         }
         let dir = tempdir().expect("tempdir");
@@ -894,6 +888,96 @@ mod tests {
         assert_eq!((meta.uid(), meta.gid()), (OWNER, OWNER));
         assert_eq!(meta.permissions().mode() & 0o7777, 0o600);
         assert_eq!(std::fs::read(&password).expect("read"), b"new-pw");
+    }
+
+    /// On a rooted handle `write_secret_id_atomic` creates each missing
+    /// level under the owner of the level it is created in and gives a
+    /// fresh `secret_id` its directory's owner. `secrets/` takes a
+    /// supplementary gid so the directory's group and the writer's
+    /// differ on Linux, where a fresh entry takes the writer's primary
+    /// gid; on macOS a fresh entry inherits its directory's group
+    /// anyway. Single-gid runners skip.
+    #[tokio::test]
+    async fn rooted_write_secret_id_atomic_gives_created_entries_the_directory_group() {
+        let Some(gid) = bootroot::cert_group::one_supplementary_test_gid() else {
+            return;
+        };
+        let messages = test_messages();
+        let root = crate::test_support::SwapRoot::new();
+        std::os::unix::fs::chown(&root.secrets, None, Some(gid))
+            .expect("test process must be able to chgrp to a supplementary gid");
+        let owner = (bootroot::fs_util::current_process_euid(), gid);
+        let tree = rooted_arc(&root);
+
+        let openbao = root.secrets.join("openbao");
+        let stepca = openbao.join("stepca");
+        let secret_id = stepca.join("secret_id");
+        write_secret_id_atomic(&tree, &secret_id, "sid", &messages)
+            .await
+            .expect("write secret_id");
+
+        crate::test_support::assert_owner_and_mode(&openbao, owner, 0o700, "openbao/");
+        crate::test_support::assert_owner_and_mode(&stepca, owner, 0o700, "openbao/stepca/");
+        crate::test_support::assert_owner_and_mode(&secret_id, owner, 0o600, "secret_id");
+        assert_eq!(std::fs::read(&secret_id).expect("read"), b"sid");
+    }
+
+    /// As root over a `secrets/` another account owns, the handle is
+    /// rooted and `write_secret_id_atomic` creates `openbao/` and
+    /// `openbao/stepca/` at `0700` and a fresh `secret_id` at `0600`, all
+    /// owned by the uid and gid of `secrets/`. A `secret_id` it replaces
+    /// keeps its owner, root's included, and below a `services/` that is
+    /// already root's, the level it creates and the fresh file are
+    /// root's too.
+    #[tokio::test]
+    async fn write_secret_id_atomic_gives_created_entries_the_directory_owner_as_root_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::test_support::{FOREIGN_OWNER, assert_owner_and_mode};
+
+        if !crate::test_support::running_as_root_or_required() {
+            return;
+        }
+        let messages = test_messages();
+        let foreign = (FOREIGN_OWNER, FOREIGN_OWNER);
+        let dir = tempdir().expect("tempdir");
+        let secrets = crate::test_support::foreign_owned_secrets(dir.path());
+        let tree = Arc::new(SecretsTree::open(&secrets).expect("open handle"));
+        assert!(tree.is_rooted(), "root over a foreign-owned tree is rooted");
+
+        let openbao = secrets.join("openbao");
+        let stepca = openbao.join("stepca");
+        let secret_id = stepca.join("secret_id");
+        write_secret_id_atomic(&tree, &secret_id, "sid", &messages)
+            .await
+            .expect("write secret_id");
+        assert_owner_and_mode(&openbao, foreign, 0o700, "openbao/");
+        assert_owner_and_mode(&stepca, foreign, 0o700, "openbao/stepca/");
+        assert_owner_and_mode(&secret_id, foreign, 0o600, "openbao/stepca/secret_id");
+
+        // A replaced file keeps its owner, here root's.
+        std::os::unix::fs::chown(&secret_id, Some(0), Some(0)).expect("chown secret_id");
+        write_secret_id_atomic(&tree, &secret_id, "sid-2", &messages)
+            .await
+            .expect("rewrite secret_id");
+        assert_owner_and_mode(&secret_id, (0, 0), 0o600, "rewritten secret_id");
+        assert_eq!(std::fs::read(&secret_id).expect("read"), b"sid-2");
+
+        // A level created below a root-owned one takes root, and so does
+        // the fresh file in it.
+        let services = secrets.join("services");
+        std::fs::create_dir(&services).expect("mkdir services");
+        std::fs::set_permissions(&services, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod services");
+        std::os::unix::fs::chown(&services, Some(0), Some(0)).expect("chown services");
+        let service_dir = services.join("svc");
+        let service_secret_id = service_dir.join("secret_id");
+        write_secret_id_atomic(&tree, &service_secret_id, "svc-sid", &messages)
+            .await
+            .expect("write service secret_id");
+        assert_owner_and_mode(&services, (0, 0), 0o700, "services/");
+        assert_owner_and_mode(&service_dir, (0, 0), 0o700, "services/svc/");
+        assert_owner_and_mode(&service_secret_id, (0, 0), 0o600, "services/svc/secret_id");
     }
 
     /// A path `state.json` spelled differently from the anchor is

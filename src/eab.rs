@@ -66,11 +66,12 @@ pub async fn write_eab_file(path: &Path, kid: &str, hmac: &str) -> anyhow::Resul
 ///
 /// On a path-based handle this is exactly [`write_eab_file`]. On a
 /// rooted one every step goes through the handle and follows no name:
-/// the parent is created writer-owned at `0700`, the leaf is read
-/// without following it, a regular file already holding the payload has
-/// its mode repaired through its own descriptor, a symbolic link is
-/// replaced, and anything else is published as [`write_eab_file`]
-/// publishes it.
+/// each missing directory level is created at `0700` under the owner of
+/// the level it is created in, the leaf is read without following it, a
+/// regular file already holding the payload has its mode repaired
+/// through its own descriptor, a symbolic link is replaced, and anything
+/// else is published at `0600` under the owner of the file it replaces
+/// or, for a fresh file, of the directory it lands in.
 ///
 /// # Errors
 ///
@@ -94,7 +95,7 @@ pub async fn write_eab_file_in(
 /// [`write_key_file`] through a rooted `tree`. Blocking.
 fn write_key_file_rooted(tree: &SecretsTree, path: &Path, contents: &str) -> anyhow::Result<bool> {
     if let Some(parent) = path.parent() {
-        tree.ensure_dir_as_writer(parent)?;
+        tree.ensure_dir(parent)?;
     }
     let next = if contents.ends_with('\n') {
         contents.to_string()
@@ -118,7 +119,7 @@ fn write_key_file_rooted(tree: &SecretsTree, path: &Path, contents: &str) -> any
         fs_util::Destination::bootroot_owned(path),
         next.as_bytes(),
         StagedMode::Policy(KEY_FILE_MODE),
-        RootedOwner::Destination,
+        RootedOwner::DestinationOrContainingDir,
         fs_util::StagedDurability::FlushDirectory,
     )
     .with_context(|| format!("Failed to write EAB file: {}", path.display()))?;
@@ -713,6 +714,86 @@ mod tests {
         );
         assert_eq!(mode_of(&path), KEY_FILE_MODE);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), payload);
+    }
+
+    /// On a rooted handle the levels `write_eab_file_in` creates take the
+    /// owner of the level they are created in, and a fresh `eab.json`
+    /// its directory's; one it replaces keeps its owner. `secrets/` takes
+    /// a supplementary gid so the directory's group and the writer's
+    /// differ on Linux, where a fresh entry takes the writer's primary
+    /// gid; on macOS a fresh entry inherits its directory's group anyway.
+    /// Single-gid runners skip.
+    #[tokio::test]
+    async fn rooted_write_eab_file_gives_created_entries_the_directory_group() {
+        use crate::test_swap::{SwapRoot, assert_owner_and_mode};
+
+        let Some(gid) = crate::cert_group::one_supplementary_test_gid() else {
+            return;
+        };
+        let root = SwapRoot::new();
+        std::os::unix::fs::chown(&root.secrets, None, Some(gid))
+            .expect("test process must be able to chgrp to a supplementary gid");
+        let owner = (crate::fs_util::current_process_euid(), gid);
+        let tree = root.rooted();
+        let services = root.secrets.join("services");
+        let service_dir = services.join("svc");
+        let path = service_dir.join("eab.json");
+
+        assert!(
+            write_eab_file_in(&tree, &path, "kid-1", "hmac-1")
+                .await
+                .unwrap()
+        );
+        assert_owner_and_mode(&services, owner, 0o700, "services/");
+        assert_owner_and_mode(&service_dir, owner, 0o700, "services/svc/");
+        assert_owner_and_mode(&path, owner, KEY_FILE_MODE, "eab.json");
+
+        let egid = crate::cert_group::current_process_egid();
+        std::os::unix::fs::chown(&path, None, Some(egid)).unwrap();
+        assert!(
+            write_eab_file_in(&tree, &path, "kid-2", "hmac-2")
+                .await
+                .unwrap()
+        );
+        assert_owner_and_mode(&path, (owner.0, egid), KEY_FILE_MODE, "replaced eab.json");
+    }
+
+    /// As root over a `secrets/` another account owns, `write_eab_file_in`
+    /// creates `services/` and `services/<registration>/` at `0700` and
+    /// `eab.json` at `0600`, all owned by the uid and gid of `secrets/`;
+    /// a republish keeps the owner an operator gave the file.
+    #[tokio::test]
+    async fn write_eab_file_in_gives_created_entries_the_secrets_owner_as_root_only() {
+        use crate::test_swap::{FOREIGN_OWNER, assert_owner_and_mode};
+
+        if !crate::test_swap::running_as_root_or_required() {
+            return;
+        }
+        let foreign = (FOREIGN_OWNER, FOREIGN_OWNER);
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = crate::test_swap::foreign_owned_secrets(dir.path());
+        let tree = Arc::new(SecretsTree::open(&secrets).unwrap());
+        assert!(tree.is_rooted(), "root over a foreign-owned tree is rooted");
+        let services = secrets.join("services");
+        let service_dir = services.join("svc");
+        let path = service_dir.join("eab.json");
+
+        assert!(
+            write_eab_file_in(&tree, &path, "kid-1", "hmac-1")
+                .await
+                .unwrap()
+        );
+        assert_owner_and_mode(&services, foreign, 0o700, "services/");
+        assert_owner_and_mode(&service_dir, foreign, 0o700, "services/svc/");
+        assert_owner_and_mode(&path, foreign, KEY_FILE_MODE, "eab.json");
+
+        std::os::unix::fs::chown(&path, Some(0), Some(0)).unwrap();
+        assert!(
+            write_eab_file_in(&tree, &path, "kid-2", "hmac-2")
+                .await
+                .unwrap()
+        );
+        assert_owner_and_mode(&path, (0, 0), KEY_FILE_MODE, "replaced eab.json");
     }
 
     #[tokio::test]

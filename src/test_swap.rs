@@ -142,6 +142,52 @@ pub(crate) fn assert_error_names(err: &anyhow::Error, path: &Path) {
     );
 }
 
+/// The uid and gid a root-only test gives `secrets/`: an account other
+/// than root, as an installer that runs the containers as dedicated
+/// host accounts sets the tree up.
+pub(crate) const FOREIGN_OWNER: u32 = 65_534;
+
+/// Whether a root-only test should run: it runs as root, and fails
+/// rather than skips when `BOOTROOT_E2E_REQUIRE_CERT_OWNER=1` asks for
+/// it and the process is not root, so a CI step that meant to run it as
+/// root cannot pass by skipping it.
+pub(crate) fn running_as_root_or_required() -> bool {
+    if crate::fs_util::current_process_euid() == 0 {
+        return true;
+    }
+    assert!(
+        std::env::var_os("BOOTROOT_E2E_REQUIRE_CERT_OWNER").is_none_or(|value| value != "1"),
+        "BOOTROOT_E2E_REQUIRE_CERT_OWNER=1 requires this test to run as root"
+    );
+    false
+}
+
+/// Creates `secrets/` in `root` at `0700`, owned by [`FOREIGN_OWNER`]
+/// for both uid and gid, and returns its path. Root only.
+pub(crate) fn foreign_owned_secrets(root: &Path) -> PathBuf {
+    let secrets = root.join("secrets");
+    std::fs::create_dir(&secrets).expect("mkdir secrets");
+    std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o700))
+        .expect("chmod secrets");
+    std::os::unix::fs::chown(&secrets, Some(FOREIGN_OWNER), Some(FOREIGN_OWNER))
+        .expect("chown secrets");
+    secrets
+}
+
+/// Asserts the uid, gid and mode of `path`, not following a link.
+///
+/// The failure message names the entry by `label`, the test's own
+/// description of it, rather than by its path below `secrets/`.
+#[track_caller]
+pub(crate) fn assert_owner_and_mode(path: &Path, owner: (u32, u32), mode: u32, label: &str) {
+    let meta = std::fs::symlink_metadata(path).expect("stat");
+    assert_eq!(
+        (meta.uid(), meta.gid(), meta.permissions().mode() & 0o7777),
+        (owner.0, owner.1, mode),
+        "uid, gid and mode of {label}"
+    );
+}
+
 /// The mode and owner of `path`, not following a link.
 pub(crate) fn mode_and_owner(path: &Path) -> (u32, u32, u32) {
     use std::os::unix::fs::MetadataExt;
