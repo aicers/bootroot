@@ -22,7 +22,7 @@ mod unix_integration {
 
     /// The `PostgreSQL` image step-ca's database runs, per the runtime
     /// declaration.
-    const POSTGRES_IMAGE: &str = "postgres:18.4";
+    const POSTGRES_IMAGE: &str = "postgres:18.6";
     const DB_USER: &str = "itest";
     const DB_NAME: &str = "postgres";
     const PROVISION_DB_USER: &str = "stepca_user";

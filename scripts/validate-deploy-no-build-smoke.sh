@@ -139,7 +139,7 @@ for line in pins.splitlines():
         },
     }
 moving = digest("postgres-moving-tag")
-for ref in ("postgres:18.4", "docker.io/library/postgres:18.4"):
+for ref in ("postgres:18.6", "docker.io/library/postgres:18.6"):
     registry[ref] = {"target": moving, "images": {moving: {"platform": "linux/amd64"}}}
 with open(f"{state}/registry.json", "w") as handle:
     json.dump(registry, handle)

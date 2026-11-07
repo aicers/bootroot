@@ -840,19 +840,19 @@ The registry images the default stack runs are pinned in
 - `openbao` — `docker.io/openbao/openbao`, tag `2.7.2`: the OpenBao server
   and the `openbao-agent-stepca` / `openbao-agent-responder` sidecars
   `init` generates.
-- `postgres` — `docker.io/library/postgres`, tag `18.4`: step-ca's
+- `postgres` — `docker.io/library/postgres`, tag `18.6`: step-ca's
   database.
 - `step-ca` — `docker.io/smallstep/step-ca`, tag `0.30.2`: the CA server,
   and the init, TLS, rotation and ownership helper containers.
 
-Each entry also records a SemVer comparison version (`18.4.0` for
-PostgreSQL's `18.4` tag), the approved registry index digest, and the
+Each entry also records a SemVer comparison version (`18.6.0` for
+PostgreSQL's `18.6` tag), the approved registry index digest, and the
 supported platforms. The pins live there, not in the Compose values:
 
 - Release preparation pulls each image by its digest for the release
   platform (`docker pull --platform linux/amd64 <repository>@<digest>`),
   tags it with the lookup tag the Compose defaults and the helper
-  containers name (`openbao/openbao:2.7.2`, `postgres:18.4`,
+  containers name (`openbao/openbao:2.7.2`, `postgres:18.6`,
   `smallstep/step-ca:0.30.2`), and saves the archive from that tag.
 - An offline install runs exactly the tags the archives restore. Leave the
   image variables unset or set them to those tags. Do not put a `@sha256:`
