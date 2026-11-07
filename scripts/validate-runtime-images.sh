@@ -207,7 +207,7 @@ expect_pass "generated OpenBao Agent sidecars run the declared image" \
 QUALIFIED="$(override qualified '
 services:
   postgres:
-    image: docker.io/library/postgres:18.4
+    image: docker.io/library/postgres:18.6
   openbao:
     image: index.docker.io/openbao/openbao:2.7.2')"
 expect_pass "Docker Hub shorthand and qualified spellings are one repository" \
@@ -216,7 +216,7 @@ expect_pass "Docker Hub shorthand and qualified spellings are one repository" \
 PINNED="$(override pinned "
 services:
   postgres:
-    image: postgres:18.4@$(run_checker --declaration "$DECLARATION" pins |
+    image: postgres:18.6@$(run_checker --declaration "$DECLARATION" pins |
   awk -F'\t' '$1 == "postgres" { print $4 }')")"
 expect_pass "a source reference carrying the declared digest is accepted" \
   --declaration "$DECLARATION" check --compose-set "$DEPLOY" "$PINNED"
@@ -229,7 +229,7 @@ expect_pass "a digest-only change needs no Compose change" \
 
 # The comparison version is reviewed, not derived from the tag, so a
 # SemVer value the tag's spelling does not suggest is still accepted.
-REVIEWED_VERSION="$(mutate reviewed-version.json "by_role['postgres']['version'] = '18.4.1'")"
+REVIEWED_VERSION="$(mutate reviewed-version.json "by_role['postgres']['version'] = '18.6.1'")"
 expect_pass "a reviewed version is not checked against the tag" \
   --declaration "$REVIEWED_VERSION" check --compose-set "$DEPLOY"
 
@@ -273,12 +273,12 @@ fail_declaration "missing digest" "is missing fields: digest" "del by_role['post
 fail_declaration "uppercase digest" "must be 'sha256:' followed by 64 lowercase hex" \
   "by_role['postgres']['digest'] = by_role['postgres']['digest'].upper()"
 fail_declaration "short digest" "must be 'sha256:' followed by 64 lowercase hex" \
-  "by_role['postgres']['digest'] = 'sha256:32ca0af8'"
+  "by_role['postgres']['digest'] = 'sha256:e3d24f69'"
 fail_declaration "placeholder digest" "is a placeholder" \
   "by_role['postgres']['digest'] = 'sha256:' + 'd' * 64"
 fail_declaration "missing version" "is missing fields: version" "del by_role['postgres']['version']"
-fail_declaration "non-SemVer version" "version '18.4' must be a canonical SemVer" \
-  "by_role['postgres']['version'] = '18.4'"
+fail_declaration "non-SemVer version" "version '18.6' must be a canonical SemVer" \
+  "by_role['postgres']['version'] = '18.6'"
 fail_declaration "missing platforms" "is missing fields: platforms" \
   "del by_role['step-ca']['platforms']"
 fail_declaration "empty platforms" "platforms must be a nonempty list" \
@@ -291,8 +291,8 @@ fail_declaration "repository without a registry" "must name its registry explici
   "by_role['postgres']['repository'] = 'postgres'"
 fail_declaration "non-canonical Docker Hub repository" "use 'docker.io/library/postgres'" \
   "by_role['postgres']['repository'] = 'docker.io/postgres'"
-fail_declaration "repository carrying a tag" "invalid path component 'postgres:18.4'" \
-  "by_role['postgres']['repository'] = 'docker.io/library/postgres:18.4'"
+fail_declaration "repository carrying a tag" "invalid path component 'postgres:18.6'" \
+  "by_role['postgres']['repository'] = 'docker.io/library/postgres:18.6'"
 fail_declaration "tag-only declaration" "is missing fields: digest, platforms" \
   "d['dependencies'] = [{k: e[k] for k in ('dependency', 'repository', 'tag', 'version')} for e in d['dependencies']]"
 
@@ -337,7 +337,7 @@ expect_fail "product-built image declared" "declared dependency 'bootroot-http01
 
 TAG_ONLY_CHANGE="$(mutate tag-change.json \
   "by_role['postgres']['tag'] = '18.5'; by_role['postgres']['version'] = '18.5.0'")"
-expect_fail "tag change not mirrored by Compose" "tag '18.4' does not match declared '18.5'" \
+expect_fail "tag change not mirrored by Compose" "tag '18.6' does not match declared '18.5'" \
   --declaration "$TAG_ONLY_CHANGE" check "${REAL_SETS[@]}"
 
 ADDED="$(override added '
@@ -350,7 +350,7 @@ expect_fail "caller-added undeclared active service" "unclassified service 'cach
 ADDED_DECLARED_IMAGE="$(override added-declared-image '
 services:
   postgres-replica:
-    image: postgres:18.4')"
+    image: postgres:18.6')"
 expect_fail "caller-added service reusing a declared image" \
   "unclassified service 'postgres-replica'" \
   --declaration "$DECLARATION" check --compose-set "$DEPLOY" "$ADDED_DECLARED_IMAGE"
@@ -393,13 +393,13 @@ WRONG_TAG="$(override wrong-tag '
 services:
   postgres:
     image: postgres:99')"
-expect_fail "explicit override changing the image tag" "tag '99' does not match declared '18.4'" \
+expect_fail "explicit override changing the image tag" "tag '99' does not match declared '18.6'" \
   --declaration "$DECLARATION" check --compose-set "$DEPLOY" "$WRONG_TAG"
 
 WRONG_REPOSITORY="$(override wrong-repository '
 services:
   postgres:
-    image: bitnami/postgresql:18.4')"
+    image: bitnami/postgresql:18.6')"
 expect_fail "mismatched repository" \
   "repository 'docker.io/bitnami/postgresql' does not match declared 'docker.io/library/postgres'" \
   --declaration "$DECLARATION" check --compose-set "$DEPLOY" "$WRONG_REPOSITORY"
@@ -431,7 +431,7 @@ expect_fail "localhost is not a Docker Hub namespace" \
 WRONG_DIGEST="$(override wrong-digest "
 services:
   postgres:
-    image: postgres:18.4@$OTHER_DIGEST")"
+    image: postgres:18.6@$OTHER_DIGEST")"
 expect_fail "source reference pinning another digest" "does not match declared sha256:" \
   --declaration "$DECLARATION" check --compose-set "$DEPLOY" "$WRONG_DIGEST"
 
@@ -501,7 +501,7 @@ expect_fail "product-built responder renamed" \
 CUSTOM_VARIABLE="$(override custom-variable '
 services:
   postgres:
-    image: ${CUSTOM_POSTGRES_IMAGE:-postgres:18.4}')"
+    image: ${CUSTOM_POSTGRES_IMAGE:-postgres:18.6}')"
 CUSTOM_POSTGRES_IMAGE=postgres:99 expect_pass "fixture image variables are cleared too" \
   --declaration "$DECLARATION" check --compose-set "$DEPLOY" "$CUSTOM_VARIABLE"
 
