@@ -17,6 +17,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && '-dispatch' || (github.run_attempt != '1' && format('-rerun-{0}', github.run_id) || '') }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -24,57 +28,66 @@ jobs:
   changes:
     name: Change Filter
     runs-on: ubuntu-latest
+    # The filter only reads the checked-out history, so `contents: read` is
+    # all it needs.
+    permissions:
+      contents: read
     outputs:
-      docs_only: ${{ steps.decide.outputs.docs_only }}
+      docs_only: ${{ steps.scope.outputs.docs-only }}
     steps:
+      # The full history, because the action diffs locally and does not
+      # fetch: a pull request against its merge-base with the base branch,
+      # a push to `main` against `github.event.before`, and a dispatched
+      # branch against its merge-base with `main`.
       - uses: actions/checkout@v7
-
-      - name: Filter Paths
-        id: filter
-        uses: dorny/paths-filter@v4
         with:
-          filters: |
-            all:
-              - "**"
-            docs:
-              - "docs/**"
-              - "**/*.md"
-              - "mkdocs.yml"
-              - ".markdownlint*"
-              - ".agent-instructions.toml"
-            code:
-              - "src/**"
-              - "tests/**"
-              - "scripts/**"
-              - "Cargo.toml"
-              - "Cargo.lock"
-              - "pyproject.toml"
-              - "docker-compose.yml"
-              - "docker-compose.deploy.yml"
-              - "docker-compose.test.yml"
-              - "deploy/**"
-              - "docker/**/Dockerfile"
-              - "responder.toml.example"
-              - ".github/workflows/**"
+          fetch-depth: 0
 
-      # Docs-only means every changed path is on the `docs` list and none is
-      # on `code`. Comparing the counts is what makes a path on neither list
-      # (`openbao/openbao.hcl`, `monitoring/**`, `.clippy.toml`, ...) count as
-      # code: "some path is docs and none is code" let such a path ride along
-      # with a Markdown edit and skip every test job.
-      - name: Decide Docs-Only
-        id: decide
-        env:
-          ALL_COUNT: ${{ steps.filter.outputs.all_count }}
-          DOCS_COUNT: ${{ steps.filter.outputs.docs_count }}
-          DOCS: ${{ steps.filter.outputs.docs }}
-          CODE: ${{ steps.filter.outputs.code }}
-        run: |
-          if [ "${ALL_COUNT:-0}" -gt 0 ] && [ "$DOCS_COUNT" = "$ALL_COUNT" ] && [ "$DOCS" = "true" ] && [ "$CODE" != "true" ]; then
-            echo "docs_only=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-          fi
+      # Docs-only means every changed path is on the documentation list
+      # (the action's built-in `*.md`, `LICENSE`, `.agent-instructions.toml`
+      # and `.markdownlint*`, plus `docs-paths`) and none is on
+      # `not-docs-paths`. A path on neither list (`openbao/openbao.hcl`,
+      # `monitoring/**`, `.clippy.toml`, ...) counts as code, so it cannot
+      # ride along with a Markdown edit and skip every test job. Anything
+      # the action cannot establish also lands on docs-only=false.
+      #
+      # The `docs/` pages at the end of `not-docs-paths` are read by tests,
+      # so an edit to one alone must still run them:
+      # `docs/reference/provisioning.toml.example` and
+      # `docs/reference/registrar-provisioning-config.md`
+      # (`src/registrar/tests.rs`), `docs/reference/registrar-wire-contract.md`
+      # (`src/registrar/endpoint/protocol.rs`), `docs/{en,ko}/configuration.md`
+      # (`src/registrar_certs/tests.rs`, `src/config.rs`) and
+      # `docs/{en,ko}/operations.md` (`src/commands/audit_store/migration.rs`,
+      # `src/commands/audit_store/reserve.rs`).
+      - id: scope
+        uses: aicers/agent-instructions/change-scope@main
+        with:
+          docs-paths: |
+            docs/**
+            **/*.md
+            mkdocs.yml
+            .markdownlint*
+            .agent-instructions.toml
+          not-docs-paths: |
+            src/**
+            tests/**
+            scripts/**
+            Cargo.toml
+            Cargo.lock
+            pyproject.toml
+            docker-compose.yml
+            docker-compose.deploy.yml
+            docker-compose.test.yml
+            deploy/**
+            docker/**/Dockerfile
+            responder.toml.example
+            .github/workflows/**
+            docs/reference/**
+            docs/en/configuration.md
+            docs/ko/configuration.md
+            docs/en/operations.md
+            docs/ko/operations.md
 
   markdown:
     name: Markdown
@@ -107,13 +120,14 @@ jobs:
       - uses: actions/checkout@v7
         id: checkout
 
-      # Recursive. The action's default glob is `*.{md,markdown}` --
-      # repository root only -- so anything added under a directory would
-      # go unlinted without this.
+      # No `globs` input. The `globs` and `ignores` of the root
+      # `.markdownlint-cli2.yaml` are the one place that decides which files
+      # are linted, here and in a local bare `markdownlint-cli2` alike; they
+      # are recursive, so anything added under a directory is linted. The
+      # action's default `*.{md,markdown}` is only added to them and changes
+      # nothing.
       - name: Run Markdown Lint
         uses: DavidAnson/markdownlint-cli2-action@v25
-        with:
-          globs: "**/*.md"
 
       # The drift check moved here from `check` with the same reference and
       # the same guard. `@main` because the scripts are mechanism and come
@@ -1008,3 +1022,46 @@ jobs:
           name: ci-registrar-redteam-${{ github.run_id }}
           path: tmp/e2e/ci-registrar-redteam-${{ github.run_id }}
           if-no-files-found: warn
+
+  # `always()`, deliberately, and not `!cancelled()`: a cancelled run would
+  # otherwise skip this job, and GitHub counts a skipped required check as a
+  # pass. Running through cancellation lets the assertions below see the
+  # cancelled results and report red. Required checks go on `CI Gate`, not
+  # on the individual jobs: a matrix job skipped at the job level is never
+  # expanded, so a docs-only run never reports `Docker E2E (<arm>)`.
+  # `markdown` and `check` are among the needs although they are not gated,
+  # so that the gate covers them too.
+  gate:
+    name: CI Gate
+    runs-on: ubuntu-latest
+    permissions: {}
+    needs: [changes, markdown, check, test-core, test-docker-e2e-matrix, test-registrar-redteam-docs]
+    if: ${{ always() }}
+    steps:
+      # A filter that errored is a defect, not a tolerable outcome. The gated
+      # jobs did still run (their `if:` fails closed), but the breakage has to
+      # be visible rather than absorbed.
+      - name: Assert the change filter succeeded
+        if: ${{ needs.changes.result != 'success' }}
+        run: |
+          echo "Change Filter: ${{ needs.changes.result }}" >&2
+          exit 1
+
+      # `skipped` is a pass here, and only here: it is what a gated job
+      # reports on a docs-only change, and what `Registrar Redteam
+      # (docs-only)` reports on any other. `cancelled` is not.
+      - name: Assert every job passed or was skipped
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "${RESULTS}"
+          bad="$(printf '%s' "${RESULTS}" \
+            | jq -r 'to_entries[]
+                     | select(.value.result != "success" and .value.result != "skipped")
+                     | "  \(.key): \(.value.result)"')"
+          if [ -n "${bad}" ]; then
+            echo "Not green:" >&2
+            echo "${bad}" >&2
+            exit 1
+          fi

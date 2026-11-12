@@ -538,8 +538,12 @@ Where the crate handles key material or secrets:
 
 - CI (workflow `CI`, `.github/workflows/ci.yml`) runs on pull requests and
   on pushes to `main`. Its jobs:
-  - `Markdown`: `markdownlint-cli2` over `**/*.md`, and the shared
-    instruction-block drift check. Not gated by the change filter.
+  - `Change Filter` (`changes`): decides whether the change is
+    documentation-only, through `aicers/agent-instructions/change-scope`.
+  - `Markdown`: `markdownlint-cli2` over the files the `globs` and
+    `ignores` of the root `.markdownlint-cli2.yaml` select (`**/*.md`),
+    and the shared instruction-block drift check. Not gated by the change
+    filter.
   - `Quality Check` (`check`), not gated either:
     `cargo fmt -- --check --config group_imports=StdExternalCrate`,
     `cargo clippy --all-targets -- -D warnings`,
@@ -557,6 +561,8 @@ Where the crate handles key material or secrets:
   - `Registrar Redteam (docs-only)`: the `registrar-redteam` arm alone,
     run only for a documentation-only change, which skips the two jobs
     above.
+  - `CI Gate` (`gate`): passes only when `Change Filter` succeeded and
+    every other job passed or was skipped.
 - Run local checks on the host's own operating system: macOS on a Mac,
   Linux on a Linux host. Do not use a container, a virtual machine or
   another operating system in its place. The containers a Docker E2E arm
@@ -565,12 +571,13 @@ Where the crate handles key material or secrets:
   run on the host itself. A CI job or matrix entry that exists only to
   cover another operating system or platform is left to CI; every other
   check applies on any host that can run its commands.
-- A change is documentation-only when every changed path matches the
-  `docs` filter of the `changes` job in `.github/workflows/ci.yml` and
-  none matches its `code` filter. For such a change run only
-  `markdownlint-cli2 "**/*.md" "#node_modules" "#target"` and, for a
-  change under `docs/` or to `mkdocs.yml`, `./scripts/check-docs.sh`
-  (see Documentation Build below). Build and test no code.
+- A change is documentation-only when the `changes` job in
+  `.github/workflows/ci.yml` counts every changed path as documentation:
+  each is on the built-in list of `aicers/agent-instructions/change-scope`
+  or on its `docs-paths` input, and none is on its `not-docs-paths` input.
+  For such a change run only `markdownlint-cli2` and, for a change under
+  `docs/` or to `mkdocs.yml`, `./scripts/check-docs.sh` (see
+  Documentation Build below). Build and test no code.
 - Local test scope. For any other change, run these before pushing, and
   leave the rest to CI:
   - `Quality Check` in full: `./scripts/preflight/ci/check.sh`, then each
