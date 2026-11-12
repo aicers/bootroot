@@ -114,8 +114,9 @@ fn table_keys(contents: &str, name: &str) -> Vec<String> {
     let doc: toml_edit::DocumentMut = contents.parse().expect("TOML");
     doc.get(name)
         .and_then(toml_edit::Item::as_table)
-        .map(|table| table.iter().map(|(key, _)| key.to_string()).collect())
-        .unwrap_or_default()
+        .map_or_else(Default::default, |table| {
+            table.iter().map(|(key, _)| key.to_string()).collect()
+        })
 }
 
 /// The text of one top-level table of `contents`, from its header up

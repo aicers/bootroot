@@ -205,9 +205,9 @@ pub(crate) fn run_monitoring_down(args: &MonitoringDownArgs, messages: &Messages
 /// the invocation already pins, never instead of it: the compose file
 /// renders its `container_name:` values from that identity.
 fn grafana_admin_password_env(password: Option<&str>) -> Vec<(&str, &str)> {
-    password
-        .map(|password| vec![(GRAFANA_ADMIN_PASSWORD_ENV, password)])
-        .unwrap_or_default()
+    password.map_or_else(Default::default, |password| {
+        vec![(GRAFANA_ADMIN_PASSWORD_ENV, password)]
+    })
 }
 
 fn monitoring_services(profile: MonitoringProfile) -> Vec<String> {
@@ -368,15 +368,12 @@ fn read_container_env(container_id: &str, messages: &Messages) -> Result<Vec<Str
     )?;
     let value: Value = serde_json::from_str(output.trim())
         .with_context(|| messages.error_parse_container_env_failed())?;
-    let envs = value
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+    let envs = value.as_array().map_or_else(Default::default, |items| {
+        items
+            .iter()
+            .filter_map(|item| item.as_str().map(str::to_string))
+            .collect()
+    });
     Ok(envs)
 }
 

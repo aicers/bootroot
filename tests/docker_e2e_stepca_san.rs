@@ -110,8 +110,7 @@ mod unix_integration {
             serde_json::from_str(&body).with_context(|| "Prometheus targets dump is not JSON")?;
         let step_ca_is_up = parsed["data"]["activeTargets"]
             .as_array()
-            .map(Vec::as_slice)
-            .unwrap_or_default()
+            .map_or_else(Default::default, Vec::as_slice)
             .iter()
             .any(|target| target["labels"]["job"] == "step-ca" && target["health"] == "up");
         assert!(

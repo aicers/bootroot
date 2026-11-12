@@ -544,8 +544,7 @@ async fn resolve_bootstrap_args(args: BootstrapArgs) -> Result<ResolvedBootstrap
     let ca_bundle_pem = artifact.as_ref().and_then(|a| a.ca_bundle_pem.clone());
     let trusted_ca_sha256 = artifact
         .as_ref()
-        .map(|a| a.trusted_ca_sha256.clone())
-        .unwrap_or_default();
+        .map_or_else(Default::default, |a| a.trusted_ca_sha256.clone());
 
     let wrap_token = artifact.as_ref().and_then(|a| a.wrap_token.clone());
     let wrap_expires_at = artifact.as_ref().and_then(|a| a.wrap_expires_at.clone());
