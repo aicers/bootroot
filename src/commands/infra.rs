@@ -1352,8 +1352,7 @@ fn preflight_host_port(host: &str, port: u16, remediation: &str) -> Result<()> {
         }
         Err(err) => {
             let pid_hint = best_effort_listening_pid(port)
-                .map(|hint| format!(" (listener: {hint})"))
-                .unwrap_or_default();
+                .map_or_else(Default::default, |hint| format!(" (listener: {hint})"));
             anyhow::bail!("host port {addr} is already in use ({err}){pid_hint}; {remediation}");
         }
     }
