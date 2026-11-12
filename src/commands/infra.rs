@@ -78,8 +78,8 @@ const STEPCA_USER_ENV_KEY: &str = "BOOTROOT_STEPCA_USER";
 /// kernel accepts a TCP connection on the published port.  Mirrors the
 /// `OPENBAO_READY_ATTEMPTS * OPENBAO_READY_DELAY_SECS` budget used by
 /// `scripts/impl/run-reinit-recovery.sh`'s `wait_for_openbao_listening`.
-const OPENBAO_API_WAIT_ATTEMPTS: u32 = 60;
-const OPENBAO_API_WAIT_DELAY: Duration = Duration::from_millis(500);
+pub(crate) const OPENBAO_API_WAIT_ATTEMPTS: u32 = 60;
+pub(crate) const OPENBAO_API_WAIT_DELAY: Duration = Duration::from_millis(500);
 // Raft's election timeout is 15 seconds, so a node that has to wait one out
 // after an unseal still fits in this budget.
 const OPENBAO_ACTIVE_WAIT_BUDGET: Duration = Duration::from_secs(60);

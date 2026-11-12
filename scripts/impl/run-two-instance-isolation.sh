@@ -360,11 +360,13 @@ install_instance() {
 
 # `infra install` returns once every container reports `running`, which
 # is not the same as the servers inside them accepting connections.
-# `bootroot init` opens with a single-shot `OpenBao` health check and a
-# single-shot database connect — neither retries on `Connection refused`
-# — so the wait belongs here, as it does in every other `scripts/impl/`
-# script.  Both probes are scoped to this instance's own container and
-# its own published port.
+# `bootroot init` waits about 30 seconds for `OpenBao` to answer, but its
+# database connect is single-shot and does not retry on `Connection
+# refused`, so the wait belongs here, as it does in every other
+# `scripts/impl/` script; waiting for `OpenBao` here too keeps the
+# instance's readiness, and its `docker logs` on failure, in one place.
+# Both probes are scoped to this instance's own container and its own
+# published port.
 wait_for_openbao_listening() {
   local name="$1" port="$2" attempt code
   for attempt in $(seq 1 "$INFRA_READY_ATTEMPTS"); do
