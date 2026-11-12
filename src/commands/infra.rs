@@ -69,6 +69,16 @@ const UNSEAL_KEYS_PATH: &str = "secrets/openbao/unseal-keys.txt";
 /// user. `infra install` / `infra up` keep it equal to the `secrets/`
 /// owner so the container can read its own key material.
 const STEPCA_USER_ENV_KEY: &str = "BOOTROOT_STEPCA_USER";
+/// Container-side ports the shipped compose files publish each core
+/// service's host port to.  `docker compose port` is asked about these
+/// to learn whether the instance's own container already holds the
+/// resolved host port.  `PostgreSQL`'s is [`bootroot::db::DB_COMPOSE_PORT`].
+const OPENBAO_CONTAINER_PORT: u16 = 8200;
+const STEPCA_CONTAINER_PORT: u16 = 9000;
+const HTTP01_ADMIN_CONTAINER_PORT: u16 = 8080;
+/// The only host address the base compose file publishes a core service
+/// on, and so the only one `infra install`'s preflight binds.
+const PREFLIGHT_HOST: &str = "127.0.0.1";
 
 /// Total budget for the post-`docker compose up -d` wait that gives the
 /// `OpenBao` listener time to bind before the unseal helpers issue their
@@ -916,6 +926,23 @@ fn run_infra_install_locked(
         messages,
     )?;
 
+    // The identity this install acts on.  For the project an exported
+    // `COMPOSE_PROJECT_NAME` wins, then the declared identity, then the
+    // identity just recorded in `.env` — so a harness that exports the
+    // variable gets its own throwaway project while `.env` keeps the
+    // durable identity every container is named after, and the two are
+    // free to be different strings.  That is what lets a run declare a
+    // length-bounded `--instance-name` and still scope itself to a
+    // project derived separately, past the instance-name limit.
+    //
+    // Resolved before the port preflight so the preflight asks Compose
+    // about the very project `docker compose up` brings up.
+    let identity = ComposeIdentity::resolve(
+        &args.compose_file.compose_file,
+        args.instance_name.as_deref(),
+        messages,
+    )?;
+
     // Pre-bind the host-side ports the active compose stack will publish
     // so that a collision aborts before `docker compose up` half-creates
     // containers (the §4a half-up state). The flag wins over .env and
@@ -929,7 +956,34 @@ fn run_infra_install_locked(
     // bind is still on 127.0.0.1; the preflight must check those
     // localhost ports regardless of whether an override intent was
     // recorded.
-    preflight_compose_published_ports(&args.services, host_ports)?;
+    //
+    // A port the instance's own running container already publishes for
+    // that service is left to `docker compose up`, which reuses or
+    // recreates the container and so frees and re-takes the port itself:
+    // that is what lets `infra install` run again over its own stack.
+    // The query goes to the same project the `up` below acts on.
+    let published_address = |service: &str, container_port: u16| {
+        docker_compose_output(
+            &args.compose_file.compose_file,
+            &identity,
+            None,
+            &["port", service, &container_port.to_string()],
+            messages,
+        )
+    };
+    // Each recognised port is announced as it is recognised, so a later
+    // port that is refused does not swallow the lines for earlier ones.
+    preflight_compose_published_ports(
+        &args.services,
+        host_ports,
+        &published_address,
+        &mut |service, port| {
+            println!(
+                "{}",
+                messages.infra_install_port_held_by_own_container(port, service)
+            );
+        },
+    )?;
 
     // The base-only `up` below never carries the audit override, so
     // OpenBao audits through the `stdout` device. On an initialised
@@ -983,20 +1037,6 @@ fn run_infra_install_locked(
                 .map(|value| (POSTGRES_USER_ENV_KEY, value)),
         )
         .collect();
-
-    // The identity this install acts on.  For the project an exported
-    // `COMPOSE_PROJECT_NAME` wins, then the declared identity, then the
-    // identity just recorded in `.env` — so a harness that exports the
-    // variable gets its own throwaway project while `.env` keeps the
-    // durable identity every container is named after, and the two are
-    // free to be different strings.  That is what lets a run declare a
-    // length-bounded `--instance-name` and still scope itself to a
-    // project derived separately, past the instance-name limit.
-    let identity = ComposeIdentity::resolve(
-        &args.compose_file.compose_file,
-        args.instance_name.as_deref(),
-        messages,
-    )?;
 
     if should_pull_before_up(loaded_archives, args.no_build) {
         let mut pull_tail: Vec<&str> = vec!["pull", "--ignore-pull-failures"];
@@ -1541,7 +1581,12 @@ fn host_port_remediation(port: u16, env_key: &str, flag: &str) -> String {
     format!("free port {port}, set {env_key}=<unused-port> in .env, or pass {flag} <unused-port>")
 }
 
-/// Pre-binds every host-side port the active compose stack will publish.
+/// Pre-binds every host-side port the active compose stack will publish,
+/// except those the instance's own running container already publishes,
+/// which it leaves to `docker compose up` and reports to
+/// `left_to_compose` as `(service, port)` the moment it recognises each.
+/// Reporting as it goes, rather than returning the list, keeps the ports
+/// already recognised visible when a later port is refused.
 /// The bound services list is derived from `services` so a partial install
 /// (e.g. `--services openbao`) only checks the ports it will actually
 /// expose.
@@ -1552,34 +1597,72 @@ fn host_port_remediation(port: u16, env_key: &str, flag: &str) -> String {
 /// layered in until `infra up` / `init`.  So the install-time bind is
 /// always on 127.0.0.1, and the preflight always checks the localhost
 /// ports regardless of any recorded override intent.
-fn preflight_compose_published_ports(services: &[String], ports: HostPorts) -> Result<()> {
+///
+/// `published_address` answers `docker compose port <service> <container
+/// port>` for the install's own Compose project.  Only an answer of
+/// exactly `127.0.0.1:<resolved port>` skips the bind — see
+/// [`published_by_own_container`]; any other answer, or a failed query,
+/// leaves the bind check in place, so a broken Docker never weakens the
+/// preflight.
+fn preflight_compose_published_ports(
+    services: &[String],
+    ports: HostPorts,
+    published_address: &dyn Fn(&str, u16) -> Result<String>,
+    left_to_compose: &mut dyn FnMut(&str, u16),
+) -> Result<()> {
     // Every core service publishes its host port through a
     // `${*_HOST_PORT:-<default>}` interpolation, so the preflight binds
     // the *resolved* port rather than a constant. Adding a published
     // port to a core service requires a matching arm here.
     for service in services {
-        let (port, env_key, flag) = match service.as_str() {
+        let (port, container_port, env_key, flag) = match service.as_str() {
             "postgres" => (
                 ports.postgres,
+                bootroot::db::DB_COMPOSE_PORT,
                 POSTGRES_HOST_PORT_ENV,
                 "--postgres-host-port",
             ),
-            "openbao" => (ports.openbao, OPENBAO_HOST_PORT_ENV, "--openbao-host-port"),
-            "step-ca" => (ports.stepca, STEPCA_HOST_PORT_ENV, "--stepca-host-port"),
+            "openbao" => (
+                ports.openbao,
+                OPENBAO_CONTAINER_PORT,
+                OPENBAO_HOST_PORT_ENV,
+                "--openbao-host-port",
+            ),
+            "step-ca" => (
+                ports.stepca,
+                STEPCA_CONTAINER_PORT,
+                STEPCA_HOST_PORT_ENV,
+                "--stepca-host-port",
+            ),
             RESPONDER_SERVICE_NAME => (
                 ports.http01_admin,
+                HTTP01_ADMIN_CONTAINER_PORT,
                 HTTP01_ADMIN_HOST_PORT_ENV,
                 "--http01-admin-host-port",
             ),
             _ => continue,
         };
+        if published_by_own_container(published_address(service, container_port), port) {
+            left_to_compose(service, port);
+            continue;
+        }
         preflight_host_port(
-            "127.0.0.1",
+            PREFLIGHT_HOST,
             port,
             &host_port_remediation(port, env_key, flag),
         )?;
     }
     Ok(())
+}
+
+/// Reports whether a `docker compose port` answer shows the instance's
+/// own container publishing its service on exactly `127.0.0.1:<port>`.
+///
+/// A failed query (no running container, Docker unreachable), empty or
+/// unparsable output, and any other address or port all report `false`,
+/// so a port published on a wildcard bind (`0.0.0.0`) stays refused.
+fn published_by_own_container(answer: Result<String>, port: u16) -> bool {
+    answer.is_ok_and(|output| output.trim() == format!("{PREFLIGHT_HOST}:{port}"))
 }
 
 /// Best-effort lookup of the PID/command listening on `port`. Uses
@@ -3687,14 +3770,179 @@ mod tests {
                 bootroot::host_port::DEFAULT_OPENBAO_HOST_PORT,
             ))
             .ok();
-            if let Err(err) =
-                preflight_compose_published_ports(&["openbao".to_string()], default_host_ports())
-            {
+            if let Err(err) = preflight_compose_published_ports(
+                &["openbao".to_string()],
+                default_host_ports(),
+                &no_running_container,
+                &mut never_left_to_compose,
+            ) {
                 assert!(err.to_string().contains("8200"), "{err}");
                 return;
             }
         }
         panic!("preflight must abort while 8200 is held");
+    }
+
+    /// A `docker compose port` query that never answers, as when the
+    /// instance has no running container for the service.
+    fn no_running_container(_service: &str, _container_port: u16) -> Result<String> {
+        anyhow::bail!("docker compose failed: no container found")
+    }
+
+    /// A report sink for tests whose query never recognises a port.
+    fn never_left_to_compose(service: &str, port: u16) {
+        panic!("{service} port {port} must not be left to compose");
+    }
+
+    /// Every core service with the container port the preflight must ask
+    /// Compose about and the `.env` variable and flag its remediation
+    /// names.
+    fn core_services() -> [(&'static str, u16, &'static str, &'static str); 4] {
+        [
+            (
+                "postgres",
+                5432,
+                POSTGRES_HOST_PORT_ENV,
+                "--postgres-host-port",
+            ),
+            (
+                "openbao",
+                8200,
+                OPENBAO_HOST_PORT_ENV,
+                "--openbao-host-port",
+            ),
+            ("step-ca", 9000, STEPCA_HOST_PORT_ENV, "--stepca-host-port"),
+            (
+                RESPONDER_SERVICE_NAME,
+                8080,
+                HTTP01_ADMIN_HOST_PORT_ENV,
+                "--http01-admin-host-port",
+            ),
+        ]
+    }
+
+    /// A port the instance's own running container already publishes on
+    /// `127.0.0.1` for that service is left to `docker compose up`: the
+    /// preflight neither binds nor refuses it, and reports it back so
+    /// `infra install` can say so.  A sentinel holds the port, so a bind
+    /// would have failed.  The query is asked about the service and its
+    /// container port, and its answer carries Compose's trailing newline.
+    #[test]
+    fn preflight_leaves_a_port_published_by_the_own_container_to_compose() {
+        for (service, container_port, _, _) in core_services() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind sentinel");
+            let port = listener.local_addr().expect("addr").port();
+            let asked = std::cell::RefCell::new(Vec::new());
+            let query = |queried: &str, queried_port: u16| -> Result<String> {
+                asked.borrow_mut().push((queried.to_string(), queried_port));
+                Ok(format!("127.0.0.1:{port}\n"))
+            };
+            let services = [service.to_string()];
+            let mut skipped = Vec::new();
+            preflight_compose_published_ports(
+                &services,
+                host_ports_with(service, port),
+                &query,
+                &mut |left: &str, left_port| skipped.push((left.to_string(), left_port)),
+            )
+            .expect("a port held by the own container must pass");
+            assert_eq!(skipped, vec![(service.to_string(), port)], "{service}");
+            assert_eq!(
+                asked.into_inner(),
+                vec![(service.to_string(), container_port)],
+                "{service} must be queried on its container port"
+            );
+            drop(listener);
+        }
+    }
+
+    /// A port recognised as the own container's is reported the moment it
+    /// is recognised, so a later service's foreign collision, which aborts
+    /// the preflight, does not discard it: the operator still sees that
+    /// the `openbao` port was recognised alongside the `postgres` refusal.
+    #[test]
+    fn preflight_reports_a_recognised_port_before_a_later_port_is_refused() {
+        let own = std::net::TcpListener::bind("127.0.0.1:0").expect("bind own sentinel");
+        let own_port = own.local_addr().expect("addr").port();
+        let foreign = std::net::TcpListener::bind("127.0.0.1:0").expect("bind foreign sentinel");
+        let foreign_port = foreign.local_addr().expect("addr").port();
+        let query = |service: &str, _: u16| -> Result<String> {
+            match service {
+                "openbao" => Ok(format!("127.0.0.1:{own_port}\n")),
+                _ => anyhow::bail!("docker compose failed: no container found"),
+            }
+        };
+        let mut ports = host_ports_with("openbao", own_port);
+        ports.postgres = foreign_port;
+        let services = ["openbao".to_string(), "postgres".to_string()];
+        let mut reported = Vec::new();
+        let err =
+            preflight_compose_published_ports(&services, ports, &query, &mut |service, port| {
+                reported.push((service.to_string(), port));
+            })
+            .expect_err("a foreign listener on the PostgreSQL port must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!(
+                "host port 127.0.0.1:{foreign_port} is already in use"
+            )),
+            "{msg}"
+        );
+        assert!(msg.contains(POSTGRES_HOST_PORT_ENV), "{msg}");
+        assert!(msg.contains("--postgres-host-port"), "{msg}");
+        assert_eq!(reported, vec![("openbao".to_string(), own_port)]);
+        drop(own);
+        drop(foreign);
+    }
+
+    /// Every answer other than exactly `127.0.0.1:<resolved port>` leaves
+    /// today's bind check in place: another port (this project's
+    /// container for a different service, say), another address
+    /// (including IPv6 loopback and the wildcard an override publishes
+    /// on), empty or unparsable output, and a failed query.  Each is
+    /// refused with today's message and remediation.
+    #[test]
+    fn preflight_refuses_a_held_port_on_any_other_answer() {
+        for (service, _, env_key, flag) in core_services() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind sentinel");
+            let port = listener.local_addr().expect("addr").port();
+            let other_port = port.checked_add(1).unwrap_or(port - 1);
+            let answers: Vec<Option<String>> = vec![
+                Some(format!("127.0.0.1:{other_port}\n")),
+                Some(format!("[::1]:{port}\n")),
+                Some(format!("0.0.0.0:{port}\n")),
+                Some(format!("[::]:{port}\n")),
+                Some(format!("127.0.0.2:{port}\n")),
+                Some(String::new()),
+                Some("\n".to_string()),
+                Some(format!("127.0.0.1:{port} extra\n")),
+                Some("not an address\n".to_string()),
+                None,
+            ];
+            for answer in answers {
+                let query = |_: &str, _: u16| -> Result<String> {
+                    answer
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("docker compose failed: daemon unreachable"))
+                };
+                let services = [service.to_string()];
+                let err = preflight_compose_published_ports(
+                    &services,
+                    host_ports_with(service, port),
+                    &query,
+                    &mut never_left_to_compose,
+                )
+                .expect_err("a held port must be refused unless the own container holds it");
+                let msg = err.to_string();
+                assert!(
+                    msg.contains(&format!("host port 127.0.0.1:{port} is already in use")),
+                    "{service} answer {answer:?}: {msg}"
+                );
+                assert!(msg.contains(env_key), "{service} answer {answer:?}: {msg}");
+                assert!(msg.contains(flag), "{service} answer {answer:?}: {msg}");
+            }
+            drop(listener);
+        }
     }
 
     /// The compose-declared defaults, for tests that only exercise one
@@ -4015,6 +4263,7 @@ mod tests {
     fn host_ports_with(service: &str, port: u16) -> HostPorts {
         let mut ports = default_host_ports();
         match service {
+            "postgres" => ports.postgres = port,
             "openbao" => ports.openbao = port,
             "step-ca" => ports.stepca = port,
             RESPONDER_SERVICE_NAME => ports.http01_admin = port,
@@ -4057,6 +4306,8 @@ mod tests {
             let err = preflight_compose_published_ports(
                 &[service.to_string()],
                 host_ports_with(service, port),
+                &no_running_container,
+                &mut never_left_to_compose,
             )
             .expect_err("a listener on the resolved port must abort the install");
             let msg = err.to_string();
@@ -4101,6 +4352,8 @@ mod tests {
                 match preflight_compose_published_ports(
                     &[service.to_string()],
                     host_ports_with(service, resolved),
+                    &no_running_container,
+                    &mut never_left_to_compose,
                 ) {
                     Ok(()) => {
                         passed = true;

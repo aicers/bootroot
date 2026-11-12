@@ -501,6 +501,7 @@ pub(crate) struct Strings {
     pub(crate) next_steps_run_status: &'static str,
     pub(crate) next_steps_eab_hint: &'static str,
     pub(crate) infra_install_completed: &'static str,
+    pub(crate) infra_install_port_held_by_own_container: &'static str,
     pub(crate) infra_install_env_written: &'static str,
     pub(crate) infra_install_dirs_created: &'static str,
     pub(crate) error_infra_install_failed: &'static str,

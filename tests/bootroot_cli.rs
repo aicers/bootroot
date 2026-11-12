@@ -612,6 +612,144 @@ fn test_infra_install_separates_the_declared_identity_from_the_project() {
     );
 }
 
+/// Runs `infra install --services openbao` while a sentinel holds the
+/// resolved `OpenBao` host port, against a fake `docker` whose
+/// `compose ... port openbao 8200` answers `127.0.0.1:<port>` only when
+/// scoped to `-p <answering_project>` and fails otherwise, as Compose
+/// does for a project with no running container.  Returns the output
+/// and the fake's argv log.
+#[cfg(unix)]
+fn install_over_a_held_openbao_port(
+    answering_project: &str,
+    compose_project_name: Option<&str>,
+) -> (std::process::Output, String) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let harness = InstallHarness::new();
+    let sentinel = std::net::TcpListener::bind("127.0.0.1:0").expect("bind sentinel");
+    let port = sentinel.local_addr().expect("sentinel address").port();
+    let fake_docker = format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >>"{log}"
+
+if [ "${{1:-}}" = "compose" ]; then
+  case " $* " in
+    *" port openbao 8200 "*)
+      case " $* " in
+        *" -p {answering_project} "*) printf '127.0.0.1:{port}\n'; exit 0 ;;
+        *) echo "no container found for service openbao" >&2; exit 1 ;;
+      esac ;;
+  esac
+  printf "cid-openbao"
+  exit 0
+fi
+
+if [ "${{1:-}}" = "inspect" ]; then
+  printf "running|healthy"
+  exit 0
+fi
+
+exit 0
+"#,
+        log = harness.argv_log.display(),
+    );
+    let docker_path = harness.bin_dir.join("docker");
+    std::fs::write(&docker_path, fake_docker).expect("write fake docker");
+    std::fs::set_permissions(&docker_path, std::fs::Permissions::from_mode(0o700))
+        .expect("chmod fake docker");
+
+    let path = std::env::var("PATH").unwrap_or_default();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_bootroot"));
+    command
+        .current_dir(harness.dir.path())
+        .args([
+            "infra",
+            "install",
+            "--compose-file",
+            harness.compose_file.to_string_lossy().as_ref(),
+            "--services",
+            "openbao",
+            "--openbao-host-port",
+            &port.to_string(),
+            "--instance-name",
+            "insight",
+        ])
+        .env("PATH", format!("{}:{}", harness.bin_dir.display(), path))
+        .env_remove("BOOTROOT_INSTANCE")
+        .env_remove("BOOTROOT_OPENBAO_USER")
+        .env_remove("BOOTROOT_POSTGRES_USER");
+    match compose_project_name {
+        Some(value) => command.env("COMPOSE_PROJECT_NAME", value),
+        None => command.env_remove("COMPOSE_PROJECT_NAME"),
+    };
+    let output = command.output().expect("run infra install");
+    drop(sentinel);
+    let argv = std::fs::read_to_string(&harness.argv_log).unwrap_or_default();
+    (output, argv)
+}
+
+/// Part of #1202: a port the instance's own running container already
+/// publishes is left to `docker compose up`, and the query that finds it
+/// is scoped to the very project `up` acts on — here an exported
+/// `COMPOSE_PROJECT_NAME`, not the declared instance.
+#[cfg(unix)]
+#[test]
+fn test_infra_install_leaves_a_port_its_own_container_holds_to_compose() {
+    const RUN_PROJECT: &str = "bootroot-e2e-rerun-project";
+    let (output, argv) = install_over_a_held_openbao_port(RUN_PROJECT, Some(RUN_PROJECT));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "infra install must pass over its own container's port: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("is already published by this instance's running openbao container"),
+        "the skip must be reported: {stdout}"
+    );
+    InstallHarness::assert_every_compose_scoped_to(&argv, RUN_PROJECT);
+    assert!(
+        argv.lines()
+            .any(|line| line.starts_with("compose ") && line.ends_with(" port openbao 8200")),
+        "the preflight must ask Compose about openbao's container port: {argv}"
+    );
+    assert!(
+        argv.lines()
+            .any(|line| line.starts_with("compose ") && line.contains(" up ")),
+        "docker compose up must still run: {argv}"
+    );
+}
+
+/// Part of #1202: the same port published by another project's
+/// container — another instance's, say — is still refused with today's
+/// message, before `docker compose up` runs.
+#[cfg(unix)]
+#[test]
+fn test_infra_install_refuses_a_port_another_project_holds() {
+    let (output, argv) = install_over_a_held_openbao_port("other-instance", None);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "infra install must refuse a port another project holds"
+    );
+    assert!(
+        stderr.contains("is already in use") && stderr.contains("--openbao-host-port"),
+        "today's message and remediation must be kept: {stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("is already published by"),
+        "nothing must be reported as skipped"
+    );
+    InstallHarness::assert_every_compose_scoped_to(&argv, "insight");
+    assert!(
+        !argv
+            .lines()
+            .any(|line| line.starts_with("compose ") && line.contains(" up ")),
+        "docker compose up must not run: {argv}"
+    );
+}
+
 /// Closes #745: a re-run without the flag keeps the recorded identity
 /// rather than resetting it to the default — while the generated
 /// `PostgreSQL` password survives the upsert.

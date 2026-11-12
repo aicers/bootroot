@@ -707,7 +707,17 @@ preflight always checks the localhost ports because `infra install`
 runs `docker compose up` against the base compose file only —
 `--openbao-bind` / `--http01-admin-bind` / `--stepca-bind` write
 override files for `infra up` / `init` but are not layered into the
-install-time `up`.
+install-time `up`. A port that the instance's own running container
+already publishes on `127.0.0.1` for that service (as
+`docker compose port <service> <container port>` reports it) is not
+bound but left to `docker compose up`, which reuses or recreates the
+container, and `infra install` prints a line naming the port and the
+service. So `infra install` can be run again over its own running
+stack, for example after an `init` that failed. A port held by
+anything else — a host process, another Compose project or instance,
+this instance's container for a different service, or a wildcard
+(`0.0.0.0`) publish — is still refused as above, and when Docker
+cannot answer the query every port is bind-checked as before.
 
 #### step-ca certificate SANs
 

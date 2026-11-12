@@ -486,6 +486,7 @@ pub(super) static STRINGS: Strings = Strings {
     next_steps_run_status: "  - 서비스 확인을 위해 `bootroot status`를 실행하세요.",
     next_steps_eab_hint: "  - ACME CA가 EAB를 요구한다면 외부에서 kid/hmac을 발급(번들된 OSS step-ca는 EAB를 지원하지 않음)한 뒤 {path}에 저장하거나 --eab-kid/--eab-hmac으로 다시 실행하세요.",
     infra_install_completed: "bootroot infra install: 완료",
+    infra_install_port_held_by_own_container: "호스트 포트 127.0.0.1:{port}는 이 인스턴스에서 실행 중인 {service} 컨테이너가 이미 게시하고 있으므로 docker compose up에 맡깁니다",
     infra_install_env_written: "bootroot infra install: .env 파일 작성 완료",
     infra_install_dirs_created: "bootroot infra install: 디렉터리 생성 완료",
     error_infra_install_failed: "bootroot infra install 실패",

@@ -188,6 +188,17 @@ impl Messages {
         self.strings().infra_install_completed
     }
 
+    pub(crate) fn infra_install_port_held_by_own_container(
+        &self,
+        port: u16,
+        service: &str,
+    ) -> String {
+        format_template(
+            self.strings().infra_install_port_held_by_own_container,
+            &[("port", &port.to_string()), ("service", service)],
+        )
+    }
+
     pub(crate) fn infra_install_env_written(&self) -> &'static str {
         self.strings().infra_install_env_written
     }

@@ -11,6 +11,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - `bootroot init` now waits about 30 seconds for OpenBao to start answering
   before it checks OpenBao's health, instead of failing at once when the
   OpenBao container is running but its listener is not up yet.
+- `bootroot infra install` can be run again over its own running stack, for
+  example after an `init` that failed. A port held by the same instance's
+  container is no longer reported as in use, while a port held by anything
+  else is still refused.
 
 ## [0.8.3] - 2026-11-07
 
