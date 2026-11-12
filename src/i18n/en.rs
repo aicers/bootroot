@@ -486,6 +486,7 @@ pub(super) static STRINGS: Strings = Strings {
     next_steps_run_status: "  - Run `bootroot status` to verify services.",
     next_steps_eab_hint: "  - If your ACME CA requires EAB, provision kid/hmac externally (bundled OSS step-ca does not support EAB), then store them at {path} or rerun with --eab-kid/--eab-hmac.",
     infra_install_completed: "bootroot infra install: completed",
+    infra_install_port_held_by_own_container: "Host port 127.0.0.1:{port} is already published by this instance's running {service} container; leaving it to docker compose up",
     infra_install_env_written: "bootroot infra install: .env written",
     infra_install_dirs_created: "bootroot infra install: directories created",
     error_infra_install_failed: "bootroot infra install failed",
