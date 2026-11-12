@@ -4,6 +4,14 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `bootroot init` now waits about 30 seconds for OpenBao to start answering
+  before it checks OpenBao's health, instead of failing at once when the
+  OpenBao container is running but its listener is not up yet.
+
 ## [0.8.3] - 2026-11-07
 
 ### Changed
@@ -3252,6 +3260,7 @@ byte for byte.
 
 - Initial public release of the bootroot
 
+[Unreleased]: https://github.com/aicers/bootroot/compare/0.8.3...HEAD
 [0.8.3]: https://github.com/aicers/bootroot/compare/0.8.2...0.8.3
 [0.8.2]: https://github.com/aicers/bootroot/compare/0.8.1...0.8.2
 [0.8.1]: https://github.com/aicers/bootroot/compare/0.8.0...0.8.1

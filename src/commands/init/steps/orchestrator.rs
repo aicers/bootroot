@@ -64,8 +64,9 @@ use crate::commands::guardrails::{
     validate_postgres_tls_override_scope,
 };
 use crate::commands::infra::{
-    ensure_init_prereqs_ready, has_http01_admin_bind_intent, has_openbao_bind_intent,
-    resolve_stepca_exposed_override, run_compose,
+    OPENBAO_API_WAIT_ATTEMPTS, OPENBAO_API_WAIT_DELAY, ensure_init_prereqs_ready,
+    has_http01_admin_bind_intent, has_openbao_bind_intent, resolve_stepca_exposed_override,
+    run_compose, wait_for_openbao_api_reachable_within,
 };
 use crate::commands::init::constants::OPENBAO_CONTAINER_PORT;
 use crate::commands::init::{
@@ -274,11 +275,37 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
     run_init_locked(args, &state_lock, messages).await
 }
 
+/// Waits for `OpenBao` to answer, then checks its health.
+///
+/// A container Docker reports `running` has started its process, not its
+/// listener, so `init`'s first request can land before `OpenBao` listens.
+/// `sys/seal-status` answers whether or not the vault is sealed or
+/// initialized, so polling it bridges that window; `sys/health` then runs
+/// once against a listener that is up.  A failure of either carries the
+/// health-check context on top of the underlying cause.
+async fn check_openbao_reachable(
+    client: &OpenBaoClient,
+    attempts: u32,
+    delay: std::time::Duration,
+    messages: &Messages,
+) -> Result<()> {
+    async {
+        wait_for_openbao_api_reachable_within(client, attempts, delay, messages).await?;
+        client.health_check().await
+    }
+    .await
+    .with_context(|| messages.error_openbao_health_check_failed())
+}
+
 /// [`run_init`] under the state lock its caller holds.
 ///
 /// The entry point for `reinit`, which takes the lock once for its own
 /// state writes and this run together: taking it again here would wait
 /// forever on the descriptor `reinit` already holds.
+// A linear sequence of preflight gates that must run in this order, each
+// already a call into its own helper; splitting it would only scatter the
+// order across functions.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn run_init_locked(
     args: &InitArgs,
     state_lock: &StateLock,
@@ -352,10 +379,13 @@ pub(crate) async fn run_init_locked(
     let mut client =
         OpenBaoClient::with_local_trust(&args.openbao.openbao_url, &args.secrets_dir.secrets_dir)
             .with_context(|| messages.error_openbao_client_create_failed())?;
-    client
-        .health_check()
-        .await
-        .with_context(|| messages.error_openbao_health_check_failed())?;
+    check_openbao_reachable(
+        &client,
+        OPENBAO_API_WAIT_ATTEMPTS,
+        OPENBAO_API_WAIT_DELAY,
+        messages,
+    )
+    .await?;
 
     // §5a: detect a partial-init OpenBao state and emit an actionable
     // diagnostic instead of bubbling up the opaque 403 the caller would
@@ -2522,6 +2552,156 @@ mod tests {
         assert!(endpoint.is_some());
         assert_eq!(rendered.as_deref(), Some(override_path.as_path()));
         assert!(store_dir.is_dir(), "the same file made complete provisions");
+    }
+
+    /// A small budget for [`check_openbao_reachable`]: about a second in
+    /// all, so a test that never gets an answer still ends quickly.
+    const REACHABLE_TEST_ATTEMPTS: u32 = 20;
+    const REACHABLE_TEST_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+    /// Returns a loopback address nothing listens on: bound to port 0
+    /// for the kernel to pick, then released.
+    fn reserve_unbound_addr() -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve address");
+        let addr = listener.local_addr().expect("local addr");
+        drop(listener);
+        addr
+    }
+
+    /// An `OpenBao` whose listener comes up only after `init` started
+    /// asking: the refused attempts are waited out, and `sys/health` is
+    /// asked once, against the listener that answered.
+    #[tokio::test]
+    async fn check_openbao_reachable_waits_for_a_late_listener() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const BIND_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
+        let addr = reserve_unbound_addr();
+        let late_server = tokio::spawn(async move {
+            tokio::time::sleep(BIND_DELAY).await;
+            let listener = std::net::TcpListener::bind(addr).expect("re-bind reserved address");
+            let server = MockServer::builder().listener(listener).start().await;
+            // `sys/health` first: the helper asks it only once
+            // `sys/seal-status` has answered, so it is in place by then.
+            Mock::given(method("GET"))
+                .and(path("/v1/sys/health"))
+                .respond_with(ResponseTemplate::new(501))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/v1/sys/seal-status"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_string(r#"{"sealed":true,"t":1,"n":1}"#),
+                )
+                .mount(&server)
+                .await;
+            server
+        });
+
+        let client = OpenBaoClient::new(&format!("http://{addr}")).expect("client");
+        let result = check_openbao_reachable(
+            &client,
+            REACHABLE_TEST_ATTEMPTS,
+            REACHABLE_TEST_DELAY,
+            &test_messages(),
+        )
+        .await;
+        let server = late_server.await.expect("late server task");
+
+        result.expect("a listener that comes up within the budget must pass");
+        let requests = server.received_requests().await.expect("recorded requests");
+        let health_requests = requests
+            .iter()
+            .filter(|request| request.url.path() == "/v1/sys/health")
+            .count();
+        assert_eq!(health_requests, 1, "sys/health must be asked exactly once");
+    }
+
+    /// An `OpenBao` that never answers fails once the budget runs out,
+    /// under the health-check message and with the connect error the
+    /// last attempt hit still in the chain.
+    #[tokio::test]
+    async fn check_openbao_reachable_fails_when_nothing_answers() {
+        let addr = reserve_unbound_addr();
+        let client = OpenBaoClient::new(&format!("http://{addr}")).expect("client");
+        let messages = test_messages();
+
+        let err = check_openbao_reachable(
+            &client,
+            REACHABLE_TEST_ATTEMPTS,
+            REACHABLE_TEST_DELAY,
+            &messages,
+        )
+        .await
+        .expect_err("a listener that never comes up must fail");
+
+        assert_eq!(
+            err.to_string(),
+            messages.error_openbao_health_check_failed()
+        );
+        assert!(
+            err.chain()
+                .any(|cause| cause.to_string() == messages.error_openbao_seal_status_failed()),
+            "the wait's own context must stay in the chain: {err:#}"
+        );
+        assert!(
+            err.chain()
+                .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
+                .any(reqwest::Error::is_connect),
+            "the last connect error must stay in the chain: {err:#}"
+        );
+    }
+
+    /// An `OpenBao` that answers `sys/seal-status` but fails `sys/health`
+    /// is reported under the health-check message too, without the
+    /// wait's context, since the wait itself succeeded.
+    #[tokio::test]
+    async fn check_openbao_reachable_reports_a_failed_health_check() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/sys/seal-status"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"{"sealed":false,"t":1,"n":1}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/sys/health"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenBaoClient::new(&server.uri()).expect("client");
+        let messages = test_messages();
+
+        let err = check_openbao_reachable(
+            &client,
+            REACHABLE_TEST_ATTEMPTS,
+            REACHABLE_TEST_DELAY,
+            &messages,
+        )
+        .await
+        .expect_err("a failing sys/health must fail the check");
+
+        assert_eq!(
+            err.to_string(),
+            messages.error_openbao_health_check_failed()
+        );
+        assert!(
+            !err.chain()
+                .any(|cause| cause.to_string() == messages.error_openbao_seal_status_failed()),
+            "a wait that succeeded must leave no context of its own: {err:#}"
+        );
+        assert!(
+            err.chain().any(|cause| cause.to_string().contains("500")),
+            "the failing status must stay in the chain: {err:#}"
+        );
     }
 
     /// Closes #588 §5a: when `OpenBao` is already initialised but no

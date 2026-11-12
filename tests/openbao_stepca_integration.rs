@@ -92,6 +92,26 @@ mod unix_integration {
             stdout.contains("bootroot init: summary"),
             "stdout was: {stdout}"
         );
+
+        // `init` waits for OpenBao to answer `sys/seal-status` before its
+        // first health check, so a listener that is not up yet is waited
+        // out rather than failing the run.
+        let requests = server
+            .received_requests()
+            .await
+            .context("wiremock must record requests")?;
+        let first_request_to = |wanted: &str| {
+            requests
+                .iter()
+                .position(|request| request.url.path() == wanted)
+        };
+        let seal_status =
+            first_request_to("/v1/sys/seal-status").context("init must request sys/seal-status")?;
+        let health = first_request_to("/v1/sys/health").context("init must request sys/health")?;
+        assert!(
+            seal_status < health,
+            "sys/seal-status (request {seal_status}) must precede sys/health (request {health})"
+        );
         Ok(())
     }
 
