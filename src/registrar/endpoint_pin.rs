@@ -649,8 +649,7 @@ pub async fn probe_endpoint(
         .get_ref()
         .1
         .peer_certificates()
-        .map(|chain| chain.iter().map(|cert| cert.clone().into_owned()).collect())
-        .unwrap_or_default();
+        .map_or_default(|chain| chain.iter().map(|cert| cert.clone().into_owned()).collect());
 
     // No request frame, only `close_notify`. A shutdown that fails has
     // met a peer that already ended the connection, and the read below

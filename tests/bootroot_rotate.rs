@@ -3040,7 +3040,7 @@ async fn test_rotate_ca_key_resumes_from_phase() {
     )
     .expect("write rotation-state.json");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+    let output = resumed_ca_rotation_command(temp_dir.path())
         .current_dir(temp_dir.path())
         .args([
             "rotate",
@@ -3105,7 +3105,7 @@ async fn test_rotate_ca_key_finalize_blocks_unmigrated() {
     .expect("write rotation-state.json");
 
     // Service certs don't exist — Phase 6 should see them as un-migrated and block.
-    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+    let output = resumed_ca_rotation_command(temp_dir.path())
         .current_dir(temp_dir.path())
         .args([
             "rotate",
@@ -3128,6 +3128,21 @@ async fn test_rotate_ca_key_finalize_blocks_unmigrated() {
         stderr.contains("Cannot finalize") || stderr.contains(SERVICE_NAME),
         "stderr should mention finalization blocked or the service name: {stderr}"
     );
+}
+
+/// Resumed rotations still run the Docker ownership sweep before their
+/// remaining phases. Keep that prerequisite local to the test fixture.
+fn resumed_ca_rotation_command(root: &Path) -> Command {
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let docker_log = root.join("docker.log");
+    write_fake_docker(&bin_dir, &docker_log).expect("write fake docker");
+    let inherited_path = env::var_os("PATH").unwrap_or_default();
+    let path = env::join_paths(std::iter::once(bin_dir).chain(env::split_paths(&inherited_path)))
+        .expect("join test PATH");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_bootroot"));
+    command.env("PATH", path).env("DOCKER_OUTPUT", docker_log);
+    command
 }
 
 /// Common name every `rotate ca-key` gives the intermediate it generates.
@@ -3693,7 +3708,7 @@ async fn test_rotate_ca_key_cleanup_deletes_backups() {
     )
     .expect("write rotation-state.json");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+    let output = resumed_ca_rotation_command(temp_dir.path())
         .current_dir(temp_dir.path())
         .args([
             "rotate",
@@ -3786,7 +3801,7 @@ async fn test_rotate_ca_key_skip_reissue_skips_phase_5() {
     fs::create_dir_all(service_cert.parent().unwrap()).ok();
     fs::write(&service_cert, "dummy-cert-data").ok();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+    let output = resumed_ca_rotation_command(temp_dir.path())
         .current_dir(temp_dir.path())
         .args([
             "rotate",
@@ -3867,7 +3882,7 @@ async fn test_rotate_ca_key_force_finalize_with_unmigrated() {
 
     // Service certs don't match new intermediate → normally blocks finalization
     // --force should override
-    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+    let output = resumed_ca_rotation_command(temp_dir.path())
         .current_dir(temp_dir.path())
         .args([
             "rotate",
@@ -4234,7 +4249,7 @@ async fn test_rotate_ca_key_full_force_finalize_enhanced_warning() {
 
     // Service certs don't match new intermediate → blocks finalization
     // --force should override with enhanced full-mode warning
-    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+    let output = resumed_ca_rotation_command(temp_dir.path())
         .current_dir(temp_dir.path())
         .args([
             "rotate",
@@ -4480,7 +4495,7 @@ async fn test_rotate_ca_key_full_mode_cleanup_deletes_root_backups() {
     )
     .expect("write rotation-state.json");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+    let output = resumed_ca_rotation_command(temp_dir.path())
         .current_dir(temp_dir.path())
         .args([
             "rotate",
@@ -4620,7 +4635,7 @@ async fn test_rotate_ca_key_full_mode_resumes_from_phase() {
     )
     .expect("write rotation-state.json");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+    let output = resumed_ca_rotation_command(temp_dir.path())
         .current_dir(temp_dir.path())
         .args([
             "rotate",

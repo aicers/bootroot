@@ -1926,13 +1926,12 @@ async fn read_trust_pins_from_config(config_path: &Path) -> Result<Vec<String>> 
         .get("trust")
         .and_then(|trust| trust.get("trusted_ca_sha256"))
         .and_then(toml_edit::Item::as_array)
-        .map(|array| {
+        .map_or_default(|array| {
             array
                 .iter()
                 .filter_map(|value| value.as_str().map(str::to_string))
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     if pins.is_empty() {
         anyhow::bail!(
             "agent config at {} has no [trust].trusted_ca_sha256 pins after a trust apply",
