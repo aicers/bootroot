@@ -152,8 +152,7 @@ impl EndpointHost {
         let host = settings
             .profiles
             .first()
-            .map(|profile| profile.hostname.clone())
-            .unwrap_or_default();
+            .map_or_default(|profile| profile.hostname.clone());
         Ok(Self {
             pin_file: endpoint_pin::anchor_pin_path_for_client_certificate(&client_cert),
             server: SurfacePair {
