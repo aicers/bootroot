@@ -34,19 +34,19 @@ jobs:
                     NEXT_SECTION=$(tail -n +$((SECTION_START + 1)) CHANGELOG.md | grep -n "^## " | head -1 | cut -d: -f1)
 
                     if [ -z "$NEXT_SECTION" ]; then
-                      tail -n +$((SECTION_START + 1)) CHANGELOG.md > /tmp/release_notes_temp.txt
+                      tail -n +$((SECTION_START + 1)) CHANGELOG.md > "$RUNNER_TEMP/release_notes_temp.txt"
                     elif [ "$NEXT_SECTION" -le 1 ]; then
-                      : > /tmp/release_notes_temp.txt
+                      : > "$RUNNER_TEMP/release_notes_temp.txt"
                     else
-                      tail -n +$((SECTION_START + 1)) CHANGELOG.md | head -n $((NEXT_SECTION - 1)) > /tmp/release_notes_temp.txt
+                      tail -n +$((SECTION_START + 1)) CHANGELOG.md | head -n $((NEXT_SECTION - 1)) > "$RUNNER_TEMP/release_notes_temp.txt"
                     fi
 
                     # Remove leading blank lines, keep internal spacing
-                    sed -i '/./,$!d' /tmp/release_notes_temp.txt
+                    sed -i '/./,$!d' "$RUNNER_TEMP/release_notes_temp.txt"
                     # Remove trailing blank lines
-                    sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' /tmp/release_notes_temp.txt
+                    sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$RUNNER_TEMP/release_notes_temp.txt"
 
-                    RELEASE_NOTES_B64=$(base64 -w 0 < /tmp/release_notes_temp.txt)
+                    RELEASE_NOTES_B64=$(base64 -w 0 < "$RUNNER_TEMP/release_notes_temp.txt")
                     echo "release_notes_b64=$RELEASE_NOTES_B64" >> "$GITHUB_OUTPUT"
                   fi
 
