@@ -32,7 +32,8 @@ jobs:
             echo "::error::Read ${read_count} files, but the PR has ${CHANGED_FILES}."
             exit 1
           fi
-          if ! jq -e -s 'any(.[]; .filename == "CHANGELOG.md" or .previous_filename == "CHANGELOG.md")' "$files" > /dev/null; then
+          changed="$(jq -rs 'any(.[]; .filename == "CHANGELOG.md" or .previous_filename == "CHANGELOG.md")' "$files")"
+          if [ "$changed" = false ]; then
             echo "CHANGELOG.md is unchanged."
           elif [[ "$HEAD_REF" == release-plz-* && "$AUTHOR" == 'github-actions[bot]' ]]; then
             echo "This release PR may change CHANGELOG.md."

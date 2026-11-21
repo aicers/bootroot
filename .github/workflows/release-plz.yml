@@ -62,12 +62,48 @@ jobs:
       - name: Install Rust
         if: steps.commit.outputs.release == 'true'
         uses: dtolnay/rust-toolchain@stable
+      - name: Recover an unfinished release
+        id: recovery
+        if: steps.commit.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          tag="refs/tags/${version}"
+          if ! git show-ref --verify --quiet "$tag"; then
+            exit 0
+          fi
+          if response="$(gh api --include "repos/${GITHUB_REPOSITORY}/releases/tags/${version}")"; then
+            exit 0
+          fi
+          read -r protocol status _ <<< "$response"
+          if [[ "$protocol" != HTTP/* || "$status" != 404 ]]; then
+            echo "::error::Could not check the GitHub Release for ${version}."
+            exit 1
+          fi
+
+          tag_commit="$(git rev-parse "${tag}^{commit}")"
+          release_head="$(git rev-parse --quiet --verify HEAD^2 || git rev-parse HEAD)"
+          if [[ "$tag_commit" != "$release_head" && "$tag_commit" != "$(git rev-parse HEAD)" ]]; then
+            echo "::error::Tag ${version} points outside this release merge."
+            exit 1
+          fi
+
+          # release-plz skips a version when its tag exists locally. Keep the
+          # remote tag, and let release-plz publish the notes without retagging.
+          config="${RUNNER_TEMP}/release-plz-recovery.toml"
+          awk '1; /^\[workspace\]$/ { print "git_tag_enable = false" }' release-plz.toml > "$config"
+          git update-ref -d "$tag" "$(git rev-parse "$tag")"
+          echo "config=${config}" >> "$GITHUB_OUTPUT"
+          echo "Recovering the GitHub Release for existing tag ${version}."
       - name: Release
         if: steps.commit.outputs.release == 'true'
         uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
         with:
           command: release
           version: 0.4.3
+          config: ${{ steps.recovery.outputs.config }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
 
@@ -78,9 +114,11 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    env:
+      # The release PR job builds the same release-plz version with the local patch.
+      RELEASE_PLZ_SOURCE: 92e907a14715182c99c26eb734a4b3d7b3775a0b # release-plz-v0.4.3
     outputs:
-      changed: ${{ steps.release-plz.outputs.prs_created }}
-      pr: ${{ steps.release-plz.outputs.pr }}
+      number: ${{ steps.release-plz.outputs.number }}
     steps:
       # release-pr needs the branch name to choose the PR's base.
       - uses: actions/checkout@v7
@@ -88,36 +126,72 @@ jobs:
           ref: main
           fetch-depth: 0
           persist-credentials: false
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      - name: Check main's head
-        id: head
+      - name: Check the release PR checkout
+        id: base
         env:
           EXPECTED_SHA: ${{ needs.release.outputs.sha }}
+        run: |
+          set -euo pipefail
+          local_sha="$(git rev-parse HEAD)"
+          if [ "$local_sha" = "$EXPECTED_SHA" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Skipping release-pr: release checked ${EXPECTED_SHA}, and the checkout has ${local_sha}."
+          fi
+      - name: Install Rust
+        if: steps.base.outputs.current == 'true'
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-semver-checks
+        if: steps.base.outputs.current == 'true'
+        uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+        with:
+          tool: cargo-semver-checks@0.51.0
+      - name: Cache release-plz with the release PR fixes
+        id: cache
+        if: steps.base.outputs.current == 'true'
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/bootroot-release-plz/bin/release-plz
+          key: release-plz-${{ runner.os }}-${{ runner.arch }}-${{ env.RELEASE_PLZ_SOURCE }}-${{ hashFiles('.github/release-plz-0.4.3.patch') }}
+      - name: Build release-plz
+        if: steps.base.outputs.current == 'true' && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          source_dir="${RUNNER_TEMP}/release-plz-source"
+          git init -q "$source_dir"
+          git -C "$source_dir" fetch --depth 1 https://github.com/release-plz/release-plz.git "$RELEASE_PLZ_SOURCE"
+          git -C "$source_dir" checkout --detach FETCH_HEAD
+          git -C "$source_dir" apply "${GITHUB_WORKSPACE}/.github/release-plz-0.4.3.patch"
+          cargo install --locked --debug --no-default-features --path "$source_dir/crates/release_plz" \
+            --root "${RUNNER_TEMP}/bootroot-release-plz"
+      - name: Release PR
+        id: release-plz
+        if: steps.base.outputs.current == 'true'
+        env:
+          EXPECTED_SHA: ${{ needs.release.outputs.sha }}
+          GIT_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           ref="$(git ls-remote --exit-code origin refs/heads/main)"
           remote_sha="${ref%%$'\t'*}"
           local_sha="$(git rev-parse HEAD)"
-          if [ "$local_sha" = "$EXPECTED_SHA" ] && [ "$remote_sha" = "$EXPECTED_SHA" ]; then
-            echo "current=true" >> "$GITHUB_OUTPUT"
-          else
+          if [ "$local_sha" != "$EXPECTED_SHA" ] || [ "$remote_sha" != "$EXPECTED_SHA" ]; then
             echo "Skipping release-pr: release checked ${EXPECTED_SHA}, the checkout has ${local_sha}, and main is at ${remote_sha}."
+            exit 0
           fi
-      - name: Release PR
-        id: release-plz
-        if: steps.head.outputs.current == 'true'
-        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
-        with:
-          command: release-pr
-          version: 0.4.3
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
+          result="$("${RUNNER_TEMP}/bootroot-release-plz/bin/release-plz" release-pr --forge github \
+            --repo-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" -o json)"
+          number="$(jq -er '.prs | if type != "array" then error("expected a release PR list")
+            elif length == 0 then "" else .[0].number end' <<< "$result")"
+          if [ -n "$number" ]; then
+            [[ "$number" =~ ^[0-9]+$ ]]
+            echo "number=${number}" >> "$GITHUB_OUTPUT"
+          fi
 
   title:
     name: Check release PR title
     needs: release-pr
-    if: needs.release-pr.outputs.changed == 'true'
+    if: needs.release-pr.outputs.number != ''
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -132,12 +206,20 @@ jobs:
         id: pr
         env:
           GH_TOKEN: ${{ github.token }}
-          NUMBER: ${{ fromJSON(needs.release-pr.outputs.pr).number }}
+          NUMBER: ${{ needs.release-pr.outputs.number }}
         run: |
           set -euo pipefail
           [[ "$NUMBER" =~ ^[0-9]+$ ]]
           pr="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${NUMBER}")"
-          sha="$(jq -er '.head.sha | select(test("^[0-9a-f]{40}$"))' <<< "$pr")"
+          if ! sha="$(jq -er --arg repo "$GITHUB_REPOSITORY" '
+            select(.base.ref == "main" and .head.repo.full_name == $repo
+              and (.head.ref | startswith("release-plz-"))
+              and .user.login == "github-actions[bot]")
+            | .head.sha | select(test("^[0-9a-f]{40}$"))
+          ' <<< "$pr")"; then
+            echo "::error::PR ${NUMBER} is not a release PR with a valid head SHA."
+            exit 1
+          fi
           echo "sha=${sha}" >> "$GITHUB_OUTPUT"
           echo "title=$(jq -c .title <<< "$pr")" >> "$GITHUB_OUTPUT"
       - name: Check the title

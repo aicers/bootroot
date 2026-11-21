@@ -9,6 +9,7 @@ permissions: {}
 jobs:
   commits:
     name: List pushed commits
+    if: ${{ !github.event.deleted }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -44,8 +45,7 @@ jobs:
           before = os.environ["BEFORE"]
           after = os.environ["AFTER"]
           if before == "0" * 40:
-              print("This push created the branch. Checking its tip.")
-              commits = [after]
+              revision = after
           else:
               # A force push can leave the previous head outside the fetched refs.
               present = subprocess.run(
@@ -53,7 +53,10 @@ jobs:
               ).returncode == 0
               if not present:
                   git("fetch", "--no-tags", "origin", before)
-              commits = git("rev-list", "--first-parent", "--reverse", f"{before}..{after}").split()
+              revision = f"{before}..{after}"
+          commits = git(
+              "rev-list", "--first-parent", "--exclude-first-parent-only", "--reverse", revision
+          ).split()
 
           single = []
           failed = False
