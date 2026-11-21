@@ -239,8 +239,9 @@ Anything else is **breaking**, including:
 - a change to `ARTIFACT_SCHEMA_VERSION`
 - a bump of the binding record's `schema_version`
 
-A breaking change may land. Its PR title carries `!` and says that it
-needs a reinstall, so the generated changelog entry carries that signal.
+A breaking change may land. It is not updatable in place. Its PR title
+carries `!` and says that it needs a reinstall, so the generated changelog
+entry carries that signal.
 
 The same holds for the images a deployment runs: a postgres major version
 change, or an OpenBao or step-ca release whose upstream upgrade notes

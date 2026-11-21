@@ -12,7 +12,6 @@ permissions: {}
 concurrency:
   group: release
   cancel-in-progress: false
-  queue: max
 
 jobs:
   release:
@@ -107,7 +106,7 @@ jobs:
               .head_sha == $sha and .head_branch == "main" and .event == "push"
               and .status == "completed" and .conclusion == "success")' <<< "$runs")"
             if [[ "$passed" != true ]]; then
-              echo "Deferring release ${version} and the next release PR: merge ${RELEASE_SHA} has no successful CI push run on main."
+              echo "::warning::Deferring release ${version} and the next release PR: merge ${RELEASE_SHA} has no successful CI push run on main. If CI failed, rerun it for that merge. After it passes, rerun this workflow if main has advanced and no release PR was opened."
               echo "deferred=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -134,13 +133,17 @@ jobs:
             echo "config=${config}" >> "$GITHUB_OUTPUT"
           fi
           echo "publish=true" >> "$GITHUB_OUTPUT"
+      - name: Install Rust
+        if: steps.recovery.outputs.publish == 'true'
+        uses: dtolnay/rust-toolchain@stable
       - name: Release
         if: steps.recovery.outputs.publish == 'true'
-        uses: ./.github/actions/release-plz
+        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
         with:
           command: release
           config: ${{ steps.recovery.outputs.config }}
-          manifest-path: ${{ steps.recovery.outputs.manifest_path }}
+          manifest_path: ${{ steps.recovery.outputs.manifest_path }}
+          version: 0.4.3
         env:
           GITHUB_TOKEN: ${{ github.token }}
 
@@ -149,9 +152,6 @@ jobs:
     needs: release
     if: needs.release.outputs.deferred != 'true'
     runs-on: ubuntu-latest
-    # This job runs only after the release job accepts the event and checks
-    # out main. Populate the binary cache for later workflow_run jobs.
-    cache-mode: write
     permissions:
       contents: write
       pull-requests: write
@@ -164,6 +164,8 @@ jobs:
           ref: main
           fetch-depth: 0
           persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
       - name: Check the release PR checkout
         id: base
         env:
@@ -181,15 +183,16 @@ jobs:
       - name: Release PR
         id: release-plz
         if: steps.base.outputs.current == 'true'
-        uses: ./.github/actions/release-plz
+        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
         with:
           command: release-pr
+          version: 0.4.3
         env:
           GITHUB_TOKEN: ${{ github.token }}
 
   title:
     name: Check release PR title
-    needs: [release, release-pr]
+    needs: release-pr
     if: needs.release-pr.outputs.number != ''
     runs-on: ubuntu-latest
     permissions:
@@ -233,19 +236,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ steps.pr.outputs.sha }}
           OUTCOME: ${{ steps.check.outcome }}
-          EXPECTED_SHA: ${{ needs.release.outputs.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           if [ "$OUTCOME" = success ]; then
-            # GitHub cannot make a PR write conditional on its base SHA.
-            # If main moved during that write, leave the required status unset.
-            ref="$(git ls-remote --exit-code origin refs/heads/main)"
-            remote_sha="${ref%%$'\t'*}"
-            if [ "$remote_sha" != "$EXPECTED_SHA" ]; then
-              echo "Skipping successful title status: main moved from ${EXPECTED_SHA} to ${remote_sha}."
-              exit 0
-            fi
             state=success
             description="The title follows the Conventional Commits rule"
           else

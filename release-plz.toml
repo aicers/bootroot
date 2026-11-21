@@ -4,9 +4,6 @@ release_always = false
 git_tag_name = "{{ version }}"
 git_release_name = "{{ package }} {{ version }}"
 pr_name = "chore: release {{ version }}"
-# Before 1.0 the release PR build uses the squash title for the bump and
-# reports cargo-semver-checks findings in the release PR.
-features_always_increment_minor = false
 
 [changelog]
 header = """# Changelog
