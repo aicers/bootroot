@@ -169,7 +169,7 @@ jobs:
 
   title:
     name: Check release PR title
-    needs: release-pr
+    needs: [release, release-pr]
     if: needs.release-pr.outputs.number != ''
     runs-on: ubuntu-latest
     permissions:
@@ -213,10 +213,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ steps.pr.outputs.sha }}
           OUTCOME: ${{ steps.check.outcome }}
+          EXPECTED_SHA: ${{ needs.release.outputs.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           if [ "$OUTCOME" = success ]; then
+            # GitHub cannot make a PR write conditional on its base SHA.
+            # If main moved during that write, leave the required status unset.
+            ref="$(git ls-remote --exit-code origin refs/heads/main)"
+            remote_sha="${ref%%$'\t'*}"
+            if [ "$remote_sha" != "$EXPECTED_SHA" ]; then
+              echo "Skipping successful title status: main moved from ${EXPECTED_SHA} to ${remote_sha}."
+              exit 0
+            fi
             state=success
             description="The title follows the Conventional Commits rule"
           else
