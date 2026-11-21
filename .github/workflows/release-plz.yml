@@ -12,6 +12,7 @@ permissions: {}
 concurrency:
   group: release
   cancel-in-progress: false
+  queue: max
 
 jobs:
   release:
@@ -44,66 +45,83 @@ jobs:
           sha="$(git rev-parse HEAD)"
           echo "sha=${sha}" >> "$GITHUB_OUTPUT"
 
-          # release-plz associates a merge with a release PR by branch
-          # prefix. Check the opener and repository as well.
-          prs="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${sha}/pulls?per_page=100")"
-          merged="$(jq -s --arg sha "$sha" --arg repo "$GITHUB_REPOSITORY" '
-            any(.[][];
-              .merged_at != null and .merge_commit_sha == $sha
-              and .base.ref == "main" and .head.repo.full_name == $repo
-              and (.head.ref | startswith("release-plz-"))
-              and .user.login == "github-actions[bot]")
-          ' <<< "$prs")"
-          if [ "$merged" = true ]; then
-            echo "release=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "Skipping release: ${sha} did not merge a release PR."
-          fi
-      - name: Install Rust
-        if: steps.commit.outputs.release == 'true'
-        uses: dtolnay/rust-toolchain@stable
+          # A later push can cancel CI for the release merge itself. Its
+          # successful CI still covers a head containing that release merge.
+          candidates="$(git log --first-parent --merges --format=%H --extended-regexp \
+            --grep='^Merge pull request #[0-9]+ from aicers/release-plz-' "$sha")"
+          while IFS= read -r candidate; do
+            [ -n "$candidate" ] || continue
+            prs="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${candidate}/pulls?per_page=100")"
+            merged="$(jq -s --arg sha "$candidate" --arg repo "$GITHUB_REPOSITORY" '
+              any(.[][];
+                .merged_at != null and .merge_commit_sha == $sha
+                and .base.ref == "main" and .head.repo.full_name == $repo
+                and (.head.ref | startswith("release-plz-"))
+                and .user.login == "github-actions[bot]")
+            ' <<< "$prs")"
+            if [ "$merged" = true ]; then
+              echo "release_sha=${candidate}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done <<< "$candidates"
+          echo "Skipping release: no release PR merge at or before ${sha}."
       - name: Recover an unfinished release
         id: recovery
-        if: steps.commit.outputs.release == 'true'
+        if: steps.commit.outputs.release_sha != ''
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ steps.commit.outputs.release_sha }}
         run: |
           set -euo pipefail
-          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          version="$(git show "${RELEASE_SHA}:Cargo.toml" |
+            python3 -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["package"]["version"])')"
           tag="refs/tags/${version}"
-          if ! git show-ref --verify --quiet "$tag"; then
-            exit 0
-          fi
-          if response="$(gh api --include "repos/${GITHUB_REPOSITORY}/releases/tags/${version}")"; then
-            exit 0
-          fi
-          read -r protocol status _ <<< "$response"
-          if [[ "$protocol" != HTTP/* || "$status" != 404 ]]; then
-            echo "::error::Could not check the GitHub Release for ${version}."
-            exit 1
+          config=""
+          if git show-ref --verify --quiet "$tag"; then
+            if response="$(gh api --include "repos/${GITHUB_REPOSITORY}/releases/tags/${version}")"; then
+              echo "Skipping release: GitHub Release for ${version} already exists."
+              exit 0
+            fi
+            read -r protocol status _ <<< "$response"
+            if [[ "$protocol" != HTTP/* || "$status" != 404 ]]; then
+              echo "::error::Could not check the GitHub Release for ${version}."
+              exit 1
+            fi
+
+            tag_commit="$(git rev-parse "${tag}^{commit}")"
+            release_head="$(git rev-parse "${RELEASE_SHA}^2")"
+            if [[ "$tag_commit" != "$release_head" && "$tag_commit" != "$RELEASE_SHA" ]]; then
+              echo "::error::Tag ${version} points outside this release merge."
+              exit 1
+            fi
+
+            # release-plz skips a version when its tag exists locally. Keep the
+            # remote tag, and let release-plz publish the notes without retagging.
+            config="${RUNNER_TEMP}/release-plz-recovery.toml"
+            git show "${RELEASE_SHA}:release-plz.toml" |
+              awk '1; /^\[workspace\]$/ { print "git_tag_enable = false" }' > "$config"
+            git update-ref -d "$tag" "$(git rev-parse "$tag")"
+            echo "Recovering the GitHub Release for existing tag ${version}."
           fi
 
-          tag_commit="$(git rev-parse "${tag}^{commit}")"
-          release_head="$(git rev-parse --quiet --verify HEAD^2 || git rev-parse HEAD)"
-          if [[ "$tag_commit" != "$release_head" && "$tag_commit" != "$(git rev-parse HEAD)" ]]; then
-            echo "::error::Tag ${version} points outside this release merge."
-            exit 1
+          if [ "$RELEASE_SHA" != "$(git rev-parse HEAD)" ]; then
+            echo "Publishing release from merge ${RELEASE_SHA}."
+            release_dir="${RUNNER_TEMP}/bootroot-release"
+            git worktree add --detach "$release_dir" "$RELEASE_SHA"
+            echo "manifest_path=${release_dir}/Cargo.toml" >> "$GITHUB_OUTPUT"
+            config="${config:-${release_dir}/release-plz.toml}"
           fi
-
-          # release-plz skips a version when its tag exists locally. Keep the
-          # remote tag, and let release-plz publish the notes without retagging.
-          config="${RUNNER_TEMP}/release-plz-recovery.toml"
-          awk '1; /^\[workspace\]$/ { print "git_tag_enable = false" }' release-plz.toml > "$config"
-          git update-ref -d "$tag" "$(git rev-parse "$tag")"
-          echo "config=${config}" >> "$GITHUB_OUTPUT"
-          echo "Recovering the GitHub Release for existing tag ${version}."
+          if [ -n "$config" ]; then
+            echo "config=${config}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
       - name: Release
-        if: steps.commit.outputs.release == 'true'
-        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
+        if: steps.recovery.outputs.publish == 'true'
+        uses: ./.github/actions/release-plz
         with:
           command: release
-          version: 0.4.3
           config: ${{ steps.recovery.outputs.config }}
+          manifest-path: ${{ steps.recovery.outputs.manifest_path }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
 
@@ -111,14 +129,14 @@ jobs:
     name: Release PR
     needs: release
     runs-on: ubuntu-latest
+    # This job runs only after the release job accepts the event and checks
+    # out main. Populate the binary cache for later workflow_run jobs.
+    cache-mode: write
     permissions:
       contents: write
       pull-requests: write
-    env:
-      # The release PR job builds the same release-plz version with the local patch.
-      RELEASE_PLZ_SOURCE: 92e907a14715182c99c26eb734a4b3d7b3775a0b # release-plz-v0.4.3
     outputs:
-      number: ${{ steps.release-plz.outputs.number }}
+      number: ${{ steps.release-plz.outputs.prs_created == 'true' && fromJSON(steps.release-plz.outputs.pr).number || '' }}
     steps:
       # release-pr needs the branch name to choose the PR's base.
       - uses: actions/checkout@v7
@@ -132,46 +150,6 @@ jobs:
           EXPECTED_SHA: ${{ needs.release.outputs.sha }}
         run: |
           set -euo pipefail
-          local_sha="$(git rev-parse HEAD)"
-          if [ "$local_sha" = "$EXPECTED_SHA" ]; then
-            echo "current=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "Skipping release-pr: release checked ${EXPECTED_SHA}, and the checkout has ${local_sha}."
-          fi
-      - name: Install Rust
-        if: steps.base.outputs.current == 'true'
-        uses: dtolnay/rust-toolchain@stable
-      - name: Install cargo-semver-checks
-        if: steps.base.outputs.current == 'true'
-        uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
-        with:
-          tool: cargo-semver-checks@0.51.0
-      - name: Cache release-plz with the release PR fixes
-        id: cache
-        if: steps.base.outputs.current == 'true'
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: ${{ runner.temp }}/bootroot-release-plz/bin/release-plz
-          key: release-plz-${{ runner.os }}-${{ runner.arch }}-${{ env.RELEASE_PLZ_SOURCE }}-${{ hashFiles('.github/release-plz-0.4.3.patch') }}
-      - name: Build release-plz
-        if: steps.base.outputs.current == 'true' && steps.cache.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          source_dir="${RUNNER_TEMP}/release-plz-source"
-          git init -q "$source_dir"
-          git -C "$source_dir" fetch --depth 1 https://github.com/release-plz/release-plz.git "$RELEASE_PLZ_SOURCE"
-          git -C "$source_dir" checkout --detach FETCH_HEAD
-          git -C "$source_dir" apply "${GITHUB_WORKSPACE}/.github/release-plz-0.4.3.patch"
-          cargo install --locked --debug --no-default-features --path "$source_dir/crates/release_plz" \
-            --root "${RUNNER_TEMP}/bootroot-release-plz"
-      - name: Release PR
-        id: release-plz
-        if: steps.base.outputs.current == 'true'
-        env:
-          EXPECTED_SHA: ${{ needs.release.outputs.sha }}
-          GIT_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
           ref="$(git ls-remote --exit-code origin refs/heads/main)"
           remote_sha="${ref%%$'\t'*}"
           local_sha="$(git rev-parse HEAD)"
@@ -179,14 +157,15 @@ jobs:
             echo "Skipping release-pr: release checked ${EXPECTED_SHA}, the checkout has ${local_sha}, and main is at ${remote_sha}."
             exit 0
           fi
-          result="$("${RUNNER_TEMP}/bootroot-release-plz/bin/release-plz" release-pr --forge github \
-            --repo-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" -o json)"
-          number="$(jq -er '.prs | if type != "array" then error("expected a release PR list")
-            elif length == 0 then "" else .[0].number end' <<< "$result")"
-          if [ -n "$number" ]; then
-            [[ "$number" =~ ^[0-9]+$ ]]
-            echo "number=${number}" >> "$GITHUB_OUTPUT"
-          fi
+          echo "current=true" >> "$GITHUB_OUTPUT"
+      - name: Release PR
+        id: release-plz
+        if: steps.base.outputs.current == 'true'
+        uses: ./.github/actions/release-plz
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
   title:
     name: Check release PR title

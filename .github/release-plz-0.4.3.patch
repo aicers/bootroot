@@ -1,5 +1,5 @@
 diff --git a/crates/release_plz_core/src/command/release_pr/mod.rs b/crates/release_plz_core/src/command/release_pr/mod.rs
-index 7c3f6a0..0773425 100644
+index 7c3f6a0..eedc50e 100644
 --- a/crates/release_plz_core/src/command/release_pr/mod.rs
 +++ b/crates/release_plz_core/src/command/release_pr/mod.rs
 @@ -14,5 +14,5 @@ pub(crate) mod git;
@@ -57,7 +57,7 @@ index 7c3f6a0..0773425 100644
 +) -> anyhow::Result<Option<ReleasePr>> {
      let new_pr = {
          let project_contains_multiple_pub_packages =
-@@ -220,10 +212,50 @@ async fn open_or_update_release_pr(
+@@ -220,10 +212,43 @@ async fn open_or_update_release_pr(
          .with_labels(input.labels.clone())
      };
 -    let release_pr = match opened_release_prs.first() {
@@ -74,17 +74,7 @@ index 7c3f6a0..0773425 100644
 +        None => None,
 +    };
 +
-+    // Compare the base after preparing the release and reading its PR history.
-+    let base_ref = format!("refs/heads/{}", repo.original_branch());
-+    let local = repo.current_commit_hash()?;
-+    let remote = repo
-+        .git(&["ls-remote", "--refs", repo.original_remote(), &base_ref])
-+        .context("checking the release PR base before writing")?;
-+    if remote.split_whitespace().next() != Some(local.as_str()) {
-+        info!(
-+            "skipping release PR because {} moved from {local}",
-+            repo.original_branch()
-+        );
++    if !release_base_is_current(repo)? {
 +        return Ok(None);
 +    }
 +
@@ -102,6 +92,9 @@ index 7c3f6a0..0773425 100644
          }
          None => create_pr(git_client, repo, &new_pr).await,
      }?;
++    let Some(release_pr) = release_pr else {
++        return Ok(None);
++    };
 +
 +    for pr in opened_release_prs.iter().skip(1) {
 +        git_client
@@ -111,30 +104,188 @@ index 7c3f6a0..0773425 100644
 +    }
      let release_pr = ReleasePr {
          releases: packages_to_update
-@@ -237,5 +269,5 @@ async fn open_or_update_release_pr(
+@@ -237,5 +262,22 @@ async fn open_or_update_release_pr(
          ..release_pr
      };
 -    Ok(release_pr)
 +    Ok(Some(release_pr))
++}
++
++// GitHub cannot condition a PR write on the SHA of its base branch.
++fn release_base_is_current(repo: &Repo) -> anyhow::Result<bool> {
++    let base_ref = format!("refs/heads/{}", repo.original_branch());
++    let local = repo.current_commit_hash()?;
++    let remote = repo
++        .git(&["ls-remote", "--refs", repo.original_remote(), &base_ref])
++        .context("checking the release PR base before writing")?;
++    let current = remote.split_whitespace().next() == Some(local.as_str());
++    if !current {
++        info!(
++            "skipping release PR because {} moved from {local}",
++            repo.original_branch()
++        );
++    }
++    Ok(current)
  }
 
-@@ -243,13 +275,10 @@ async fn handle_opened_pr(
+@@ -243,16 +285,11 @@ async fn handle_opened_pr(
      git_client: &GitClient,
      opened_pr: &GitPr,
 +    pr_commits: &[PrCommit],
      repo: &Repo,
      new_pr: &Pr,
      branch_prefix: &str,
- ) -> Result<ReleasePr, anyhow::Error> {
+-) -> Result<ReleasePr, anyhow::Error> {
 -    let pr_commits = git_client
 -        .pr_commits(opened_pr.number)
 -        .await
 -        .context("cannot get commits of release-plz pr")?;
 -    let pr_contributors = contributors_from_commits(&pr_commits, git_client.forge);
+-    Ok(if pr_contributors.is_empty() {
+-        // There are no contributors, so we can force-push
+-        // in this PR, because we don't care about the git history.
++) -> anyhow::Result<Option<ReleasePr>> {
 +    let pr_contributors = contributors_from_commits(pr_commits, git_client.forge);
-     Ok(if pr_contributors.is_empty() {
-         // There are no contributors, so we can force-push
-@@ -699,7 +728,10 @@ mod tests {
++    if pr_contributors.is_empty() {
+         match update_pr(
+             git_client,
+@@ -265,36 +302,44 @@ async fn handle_opened_pr(
+         .await
+         {
+-            Ok(()) => ReleasePr::new(opened_pr, new_pr.base_branch.clone()),
+-            Err(e) => {
+-                tracing::error!(
+-                    "cannot update release pr {}: {:?}. I'm closing the old release pr and opening a new one",
+-                    opened_pr.number,
+-                    e
+-                );
+-                git_client
+-                    .close_pr(opened_pr.number)
+-                    .await
+-                    .context("cannot close old release-plz prs")?;
+-                create_pr(git_client, repo, new_pr).await?
++            Ok(true) => return Ok(Some(ReleasePr::new(opened_pr, new_pr.base_branch.clone()))),
++            Ok(false) => return Ok(None),
++            Err(error) => {
++                tracing::error!("cannot update release PR {}: {error:#}", opened_pr.number);
+             }
+         }
+-    } else {
+-        // There's a contributor, so we don't want to force-push in this PR.
+-        // We close it because we want to save the contributor's work.
+-        // TODO improvement: check how many lines the commit added, if no lines (for example a merge to update the branch),
+-        //      then don't count it as a contributor.
+-        info!("closing pr {} to preserve git history", opened_pr.html_url);
++    }
++    // Keep the current PR until the replacement has been published. A stale
++    // base or a failed write must leave the existing PR available for retry.
++    if !release_base_is_current(repo)? {
++        return Ok(None);
++    }
++    let replacement = create_pr(git_client, repo, new_pr).await?;
++    if replacement.is_some() {
+         git_client
+             .close_pr(opened_pr.number)
+             .await
+-            .context("cannot close old release-plz prs")?;
+-        create_pr(git_client, repo, new_pr).await?
+-    })
++            .context("cannot close old release-plz PR")?;
++    }
++    Ok(replacement)
+ }
+
+-async fn create_pr(git_client: &GitClient, repo: &Repo, pr: &Pr) -> anyhow::Result<ReleasePr> {
++async fn create_pr(
++    git_client: &GitClient,
++    repo: &Repo,
++    pr: &Pr,
++) -> anyhow::Result<Option<ReleasePr>> {
+     repo.checkout_new_branch(&pr.branch)?;
+     if git_client.forge == ForgeType::Github {
+         github_create_release_branch(git_client, repo, &pr.branch, &pr.title).await?;
++        // Preparing the branch makes separate API calls. Recheck before the
++        // write that publishes the PR, and remove the unused branch on a skip.
++        let current = release_base_is_current(repo);
++        if !matches!(current, Ok(true)) {
++            if let Err(error) = git_client.delete_branch(&pr.branch).await {
++                tracing::error!("cannot delete release branch {}: {error:#}", pr.branch);
++            }
++            current?;
++            return Ok(None);
++        }
+     } else {
+         create_release_branch(repo, &pr.branch, &pr.title)?;
+@@ -303,5 +348,5 @@ async fn create_pr(git_client: &GitClient, repo: &Repo, pr: &Pr) -> anyhow::Resu
+
+     let git_pr = git_client.open_pr(pr).await.context("Failed to open PR")?;
+-    Ok(ReleasePr::new(&git_pr, pr.base_branch.clone()))
++    Ok(Some(ReleasePr::new(&git_pr, pr.base_branch.clone())))
+ }
+
+@@ -313,5 +358,5 @@ async fn update_pr(
+     new_pr: &Pr,
+     branch_prefix: &str,
+-) -> anyhow::Result<()> {
++) -> anyhow::Result<bool> {
+     // sanity check to avoid doing bad things on non-release-plz branches
+     anyhow::ensure!(
+@@ -329,5 +374,7 @@ async fn update_pr(
+         // fetching the old PR branch would require separate git credentials.
+         // See https://github.com/release-plz/release-plz/issues/2957
+-        github_force_push(git_client, opened_pr.branch(), &new_pr.title, repository).await?;
++        if !github_force_push(git_client, opened_pr.branch(), &new_pr.title, repository).await? {
++            return Ok(false);
++        }
+     } else {
+         update_pr_branch(commits_number, opened_pr, repository).with_context(|| {
+@@ -358,5 +405,5 @@ async fn update_pr(
+     }
+     info!("updated pr {}", opened_pr.html_url);
+-    Ok(())
++    Ok(true)
+ }
+
+@@ -413,5 +460,5 @@ async fn github_force_push(
+     commit_message: &str,
+     repository: &Repo,
+-) -> anyhow::Result<()> {
++) -> anyhow::Result<bool> {
+     // Use a randomized suffix to avoid collisions with existing remote branches.
+     let suffix = RandomState::new().hash_one(branch);
+@@ -431,11 +478,15 @@ async fn github_force_push(
+     //   because the branch is the same as the default branch. So we can't revert the latest release-plz commit and push the new one.
+     // To learn more, see https://github.com/release-plz/release-plz/issues/1487
+-    let force_push_result: anyhow::Result<()> = async {
++    let force_push_result: anyhow::Result<bool> = async {
+         let sha =
+             github_commit_changes(client, repository, &tmp_release_branch, commit_message).await?;
++        if !release_base_is_current(repository)? {
++            return Ok(false);
++        }
+         client
+             .patch_github_ref(&format!("heads/{branch}"), &sha)
+             .await
+-            .context("failed to force push PR branch")
++            .context("failed to force push PR branch")?;
++        Ok(true)
+     }
+     .await;
+@@ -656,9 +707,11 @@ mod tests {
+
+     #[tokio::test]
+-    async fn github_updates_existing_pr_without_git_remote_access() {
++    async fn github_updates_existing_pr_without_fetching_the_pr_branch() {
+         test_logs::init();
+         let temporary = tempdir().unwrap();
+         let repo = Repo::init(temporary.path());
+-        // No remote is configured, so any git fetch or pull would fail.
++        // The remote only has the base branch.
++        repo.git(&["remote", "add", "origin", repo.directory().as_str()])
++            .unwrap();
+         fs_err::write(repo.directory().join("feature.txt"), "new feature").unwrap();
+         repo.add_all_and_commit("feat: new feature").unwrap();
+@@ -699,7 +752,10 @@ mod tests {
          let opened_pr = opened_pr("release-plz-test");
          let new_pr = new_pr(&repo);
 +        let client = github_client(&server);
@@ -146,6 +297,19 @@ index 7c3f6a0..0773425 100644
 +            &commits,
              &repo,
              &new_pr,
+@@ -709,4 +765,5 @@ mod tests {
+         .unwrap();
+
++        let updated = updated.unwrap();
+         assert_eq!(updated.number, opened_pr.number);
+         assert_eq!(updated.head_branch, opened_pr.branch());
+@@ -730,4 +787,6 @@ mod tests {
+         let temporary = tempdir().unwrap();
+         let repo = Repo::init(temporary.path());
++        repo.git(&["remote", "add", "origin", repo.directory().as_str()])
++            .unwrap();
+         let base_sha = repo.current_commit_hash().unwrap();
+         prepare_release_changes(&repo);
 diff --git a/crates/release_plz_core/src/git/forge.rs b/crates/release_plz_core/src/git/forge.rs
 index 9b30455..fd0a1d5 100644
 --- a/crates/release_plz_core/src/git/forge.rs
