@@ -4,6 +4,13 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.5](https://github.com/aicers/bootroot/compare/0.8.4...0.8.5) - 2026-11-21
+
+### Other
+
+- ci: automate releases with release-plz ([#1211](https://github.com/aicers/bootroot/pull/1211))
+- Keep the release notes scratch file out of /tmp
+
 ## [0.8.4] - 2026-11-13
 
 ### Fixed
