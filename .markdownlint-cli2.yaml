@@ -6,6 +6,7 @@ ignores:
 - .github/**
 - .venv/**
 - target/**
+- CHANGELOG.md
 config:
   MD024:
     siblings_only: true

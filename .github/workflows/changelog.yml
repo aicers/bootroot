@@ -1,0 +1,42 @@
+name: Changelog
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened]
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  changelog:
+    name: CHANGELOG.md untouched
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - name: Check CHANGELOG.md
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+          files="${RUNNER_TEMP}/changed-files.jsonl"
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${NUMBER}/files?per_page=100" \
+            --jq '.[] | {filename, previous_filename}' > "$files"
+          read_count="$(jq -s length "$files")"
+          # GitHub returns at most 3000 files from this endpoint.
+          if [ "$read_count" != "$CHANGED_FILES" ]; then
+            echo "::error::Read ${read_count} files, but the PR has ${CHANGED_FILES}."
+            exit 1
+          fi
+          if ! jq -e -s 'any(.[]; .filename == "CHANGELOG.md" or .previous_filename == "CHANGELOG.md")' "$files" > /dev/null; then
+            echo "CHANGELOG.md is unchanged."
+          elif [[ "$HEAD_REF" == release-plz-* && "$AUTHOR" == 'github-actions[bot]' ]]; then
+            echo "This release PR may change CHANGELOG.md."
+          else
+            echo "::error::Only the release PR may change CHANGELOG.md. The PR title becomes the generated changelog entry."
+            exit 1
+          fi

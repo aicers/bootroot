@@ -239,8 +239,8 @@ Anything else is **breaking**, including:
 - a change to `ARTIFACT_SCHEMA_VERSION`
 - a bump of the binding record's `schema_version`
 
-A breaking change may land. It is not updatable in place, and its
-`CHANGELOG.md` entry says that it needs a reinstall.
+A breaking change may land. Its PR title carries `!` and says that it
+needs a reinstall, so the generated changelog entry carries that signal.
 
 The same holds for the images a deployment runs: a postgres major version
 change, or an OpenBao or step-ca release whose upstream upgrade notes
@@ -272,7 +272,8 @@ The samples cover one direction only: the new code reading what older
 code wrote. They cannot detect an older binary refusing what the new code
 writes, such as a new key in a table that refuses unknown keys, and the
 per-service KV payloads have no sample at all. Such a change is breaking,
-and its `CHANGELOG.md` entry is its only signal.
+so its PR title carries `!` and says that it needs a reinstall. The
+generated changelog entry carries that signal from the title.
 
 ## 12. Compliance and Audit Positioning
 
