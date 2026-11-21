@@ -2,6 +2,7 @@
 name = "bootroot"
 version = "0.8.4"
 edition = "2024"
+publish = false
 
 [dependencies]
 anyhow = "1"

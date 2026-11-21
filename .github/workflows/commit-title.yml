@@ -1,0 +1,109 @@
+name: Commit titles
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  commits:
+    name: List pushed commits
+    if: ${{ !github.event.deleted }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      single: ${{ steps.list.outputs.single }}
+      count: ${{ steps.list.outputs.count }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify the commits
+        id: list
+        shell: python3 {0}
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+        run: |
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+
+          RELEASE_MERGE = re.compile(r"Merge pull request #[0-9]+ from aicers/release-plz-")
+          MAX_JOBS = 256
+
+          def git(*args):
+              # Decode bytes to preserve a carriage return in a title for the checker.
+              result = subprocess.run(["git", *args], check=True, stdout=subprocess.PIPE)
+              return result.stdout.decode("utf-8", errors="replace")
+
+          before = os.environ["BEFORE"]
+          after = os.environ["AFTER"]
+          if before == "0" * 40:
+              revision = after
+          else:
+              # A force push can leave the previous head outside the fetched refs.
+              present = subprocess.run(
+                  ["git", "cat-file", "-e", f"{before}^{{commit}}"], capture_output=True
+              ).returncode == 0
+              if not present:
+                  git("fetch", "--no-tags", "origin", before)
+              revision = f"{before}..{after}"
+          commits = git(
+              "rev-list", "--first-parent", "--exclude-first-parent-only", "--reverse", revision
+          ).split()
+
+          single = []
+          failed = False
+          for sha in commits:
+              parent_count = len(git("rev-list", "--parents", "-n", "1", sha).split()) - 1
+              message = git("log", "-1", "--format=%B", sha)
+              if parent_count == 1:
+                  # Preserve embedded newlines so a multiline title fails validation.
+                  title = message.split("\n\n", 1)[0].rstrip("\n")
+                  single.append({"sha": sha, "title": title})
+                  print(f"{sha}: checking squash title {ascii(title)}")
+              elif parent_count == 2 and RELEASE_MERGE.match(message):
+                  print(f"{sha}: release PR merge")
+              elif parent_count == 2:
+                  print(f"::error::{sha}: merge message must start with 'Merge pull request #<digits> from aicers/release-plz-'.")
+                  failed = True
+              else:
+                  print(f"::error::{sha}: expected one or two parents, found {parent_count}.")
+                  failed = True
+
+          if len(single) > MAX_JOBS:
+              print(f"::error::The push has {len(single)} squash titles, more than the {MAX_JOBS} jobs allowed. Check the titles by hand.")
+              single = []
+              failed = True
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"single={json.dumps(single)}\n")
+              output.write(f"count={len(single)}\n")
+          sys.exit(int(failed))
+
+  title:
+    name: Title of ${{ matrix.commit.sha }}
+    needs: commits
+    # Check squash titles even if the classification job rejected a merge.
+    if: ${{ !cancelled() && needs.commits.outputs.count != '' && needs.commits.outputs.count != '0' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        commit: ${{ fromJSON(needs.commits.outputs.single) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: aicers/agent-instructions/conventional-title@main
+        with:
+          title: ${{ matrix.commit.title }}
+          pr-suffix: "true"

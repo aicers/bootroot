@@ -1,0 +1,253 @@
+name: Release-plz
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: >-
+      ${{
+        (github.event_name == 'workflow_run'
+          && github.event.workflow_run.conclusion == 'success'
+          && github.event.workflow_run.event == 'push')
+        || (github.event_name == 'workflow_dispatch'
+          && github.ref == 'refs/heads/main')
+      }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: read
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+      deferred: ${{ steps.recovery.outputs.deferred }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || 'refs/heads/main' }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Identify the release merge
+        id: commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+          # A later run can retry publication of an earlier release merge.
+          candidates="$(git log --first-parent --merges --format=%H --extended-regexp \
+            --grep='^Merge pull request #[0-9]+ from aicers/release-plz-' "$sha")"
+          while IFS= read -r candidate; do
+            [ -n "$candidate" ] || continue
+            prs="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${candidate}/pulls?per_page=100")"
+            merged="$(jq -s --arg sha "$candidate" --arg repo "$GITHUB_REPOSITORY" '
+              any(.[][];
+                .merged_at != null and .merge_commit_sha == $sha
+                and .base.ref == "main" and .head.repo.full_name == $repo
+                and (.head.ref | startswith("release-plz-"))
+                and .user.login == "github-actions[bot]")
+            ' <<< "$prs")"
+            if [ "$merged" = true ]; then
+              echo "release_sha=${candidate}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done <<< "$candidates"
+          echo "Skipping release: no release PR merge at or before ${sha}."
+      - name: Recover an unfinished release
+        id: recovery
+        if: steps.commit.outputs.release_sha != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHECKOUT_SHA: ${{ steps.commit.outputs.sha }}
+          RELEASE_SHA: ${{ steps.commit.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+          version="$(git show "${RELEASE_SHA}:Cargo.toml" |
+            python3 -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["package"]["version"])')"
+          tag="refs/tags/${version}"
+          config=""
+          tag_commit=""
+          if git show-ref --verify --quiet "$tag"; then
+            if response="$(gh api --include "repos/${GITHUB_REPOSITORY}/releases/tags/${version}")"; then
+              echo "Skipping release: GitHub Release for ${version} already exists."
+              exit 0
+            fi
+            read -r protocol status _ <<< "$response"
+            if [[ "$protocol" != HTTP/* || "$status" != 404 ]]; then
+              echo "::error::Could not check the GitHub Release for ${version}."
+              exit 1
+            fi
+
+            tag_commit="$(git rev-parse "${tag}^{commit}")"
+            release_head="$(git rev-parse "${RELEASE_SHA}^2")"
+            if [[ "$tag_commit" != "$release_head" && "$tag_commit" != "$RELEASE_SHA" ]]; then
+              echo "::error::Tag ${version} points outside this release merge."
+              exit 1
+            fi
+          fi
+
+          # A later commit can make CI pass with fixes absent from the release.
+          if [[ "$GITHUB_EVENT_NAME" == workflow_run && "$RELEASE_SHA" != "$CHECKOUT_SHA" ]]; then
+            runs="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs" \
+              -f branch=main -f event=push -f status=success -f head_sha="$RELEASE_SHA" -F per_page=1)"
+            passed="$(jq --arg sha "$RELEASE_SHA" 'any(.workflow_runs[];
+              .head_sha == $sha and .head_branch == "main" and .event == "push"
+              and .status == "completed" and .conclusion == "success")' <<< "$runs")"
+            if [[ "$passed" != true ]]; then
+              echo "::warning::Deferring release ${version} and the next release PR: merge ${RELEASE_SHA} has no successful CI push run on main. If CI failed, rerun it for that merge. After it passes, rerun this workflow if main has advanced and no release PR was opened."
+              echo "deferred=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          if [ -n "$tag_commit" ]; then
+            # release-plz skips a version when its tag exists locally. Keep the
+            # remote tag, and let release-plz publish the notes without retagging.
+            config="${RUNNER_TEMP}/release-plz-recovery.toml"
+            git show "${RELEASE_SHA}:release-plz.toml" |
+              awk '1; /^\[workspace\]$/ { print "git_tag_enable = false" }' > "$config"
+            git update-ref -d "$tag" "$(git rev-parse "$tag")"
+            echo "Recovering the GitHub Release for existing tag ${version}."
+          fi
+
+          if [ "$RELEASE_SHA" != "$CHECKOUT_SHA" ]; then
+            echo "Publishing release from merge ${RELEASE_SHA}."
+            release_dir="${RUNNER_TEMP}/bootroot-release"
+            git worktree add --detach "$release_dir" "$RELEASE_SHA"
+            echo "manifest_path=${release_dir}/Cargo.toml" >> "$GITHUB_OUTPUT"
+            config="${config:-${release_dir}/release-plz.toml}"
+          fi
+          if [ -n "$config" ]; then
+            echo "config=${config}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+      - name: Install Rust
+        if: steps.recovery.outputs.publish == 'true'
+        uses: dtolnay/rust-toolchain@stable
+      - name: Release
+        if: steps.recovery.outputs.publish == 'true'
+        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
+        with:
+          command: release
+          config: ${{ steps.recovery.outputs.config }}
+          manifest_path: ${{ steps.recovery.outputs.manifest_path }}
+          version: 0.4.3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  release-pr:
+    name: Release PR
+    needs: release
+    if: needs.release.outputs.deferred != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      number: ${{ steps.release-plz.outputs.prs_created == 'true' && fromJSON(steps.release-plz.outputs.pr).number || '' }}
+    steps:
+      # release-pr needs the branch name to choose the PR's base.
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Check the release PR checkout
+        id: base
+        env:
+          EXPECTED_SHA: ${{ needs.release.outputs.sha }}
+        run: |
+          set -euo pipefail
+          ref="$(git ls-remote --exit-code origin refs/heads/main)"
+          remote_sha="${ref%%$'\t'*}"
+          local_sha="$(git rev-parse HEAD)"
+          if [ "$local_sha" != "$EXPECTED_SHA" ] || [ "$remote_sha" != "$EXPECTED_SHA" ]; then
+            echo "Skipping release-pr: release checked ${EXPECTED_SHA}, the checkout has ${local_sha}, and main is at ${remote_sha}."
+            exit 0
+          fi
+          echo "current=true" >> "$GITHUB_OUTPUT"
+      - name: Release PR
+        id: release-plz
+        if: steps.base.outputs.current == 'true'
+        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
+        with:
+          command: release-pr
+          version: 0.4.3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  title:
+    name: Check release PR title
+    needs: release-pr
+    if: needs.release-pr.outputs.number != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Read the release PR title and head
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NUMBER: ${{ needs.release-pr.outputs.number }}
+        run: |
+          set -euo pipefail
+          [[ "$NUMBER" =~ ^[0-9]+$ ]]
+          pr="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${NUMBER}")"
+          if ! sha="$(jq -er --arg repo "$GITHUB_REPOSITORY" '
+            select(.base.ref == "main" and .head.repo.full_name == $repo
+              and (.head.ref | startswith("release-plz-"))
+              and .user.login == "github-actions[bot]")
+            | .head.sha | select(test("^[0-9a-f]{40}$"))
+          ' <<< "$pr")"; then
+            echo "::error::PR ${NUMBER} is not a release PR with a valid head SHA."
+            exit 1
+          fi
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "title=$(jq -c .title <<< "$pr")" >> "$GITHUB_OUTPUT"
+      - name: Check the title
+        id: check
+        continue-on-error: true
+        uses: aicers/agent-instructions/conventional-title@main
+        with:
+          title: ${{ fromJSON(steps.pr.outputs.title) }}
+      # GITHUB_TOKEN's release PR creation does not run the PR title check.
+      - name: Post Validate PR title
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.pr.outputs.sha }}
+          OUTCOME: ${{ steps.check.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ "$OUTCOME" = success ]; then
+            state=success
+            description="The title follows the Conventional Commits rule"
+          else
+            state=failure
+            description="The title check failed"
+          fi
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${SHA}" \
+            -f context="Validate PR title" -f state="$state" \
+            -f description="$description" -f target_url="$RUN_URL" > /dev/null
+          echo "Posted Validate PR title: ${state} on ${SHA}"
+          [ "$state" = success ]

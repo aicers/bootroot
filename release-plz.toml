@@ -1,0 +1,26 @@
+[workspace]
+git_only = true
+release_always = false
+git_tag_name = "{{ version }}"
+git_release_name = "{{ package }} {{ version }}"
+pr_name = "chore: release {{ version }}"
+
+[changelog]
+header = """# Changelog
+
+This file documents recent notable changes to this project. The format of this
+file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
+this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+"""
+# Keep the Conventional prefix and breaking marker from the squash title.
+# The default commit parsers and PR link substitution still apply.
+body = """
+## [{{ version }}]{%- if release_link -%}({{ release_link }}){% endif %} - {{ timestamp | date(format="%Y-%m-%d") }}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+
+{% for commit in commits -%}
+- {{ commit.raw_message | split(pat="\\n") | first }}
+{% endfor -%}
+{% endfor %}
+"""
