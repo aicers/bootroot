@@ -46,9 +46,12 @@ jobs:
           sha="$(git rev-parse HEAD)"
           echo "sha=${sha}" >> "$GITHUB_OUTPUT"
 
-          # A later run can retry publication of an earlier release merge.
-          candidates="$(git log --first-parent --merges --format=%H --extended-regexp \
-            --grep='^Merge pull request #[0-9]+ from aicers/release-plz-' "$sha")"
+          # A later run can retry publication of an earlier release merge. A
+          # release PR lands as a squash commit titled `chore: release X.Y.Z (#N)`;
+          # earlier ones landed as merge commits.
+          candidates="$(git log --first-parent --format=%H --extended-regexp \
+            --grep='^Merge pull request #[0-9]+ from aicers/release-plz-' \
+            --grep='^chore: release [0-9]+\.[0-9]+\.[0-9]+ \(#[0-9]+\)$' "$sha")"
           while IFS= read -r candidate; do
             [ -n "$candidate" ] || continue
             prs="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${candidate}/pulls?per_page=100")"
@@ -91,7 +94,8 @@ jobs:
             fi
 
             tag_commit="$(git rev-parse "${tag}^{commit}")"
-            release_head="$(git rev-parse "${RELEASE_SHA}^2")"
+            # A squash release has no second parent; its tag is on the squash commit.
+            release_head="$(git rev-parse --verify --quiet "${RELEASE_SHA}^2" || true)"
             if [[ "$tag_commit" != "$release_head" && "$tag_commit" != "$RELEASE_SHA" ]]; then
               echo "::error::Tag ${version} points outside this release merge."
               exit 1
