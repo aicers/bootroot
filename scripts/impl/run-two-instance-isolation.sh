@@ -888,7 +888,7 @@ teardown_instance() {
   fi
   if ids="$(docker ps -aq --filter "label=com.docker.compose.project=${project}" 2>>"$RUN_LOG")"; then
     for id in $ids; do
-      docker rm -f "$id" >>"$RUN_LOG" 2>&1 || status=1
+      docker rm -fv "$id" >>"$RUN_LOG" 2>&1 || status=1
     done
   else
     status=1

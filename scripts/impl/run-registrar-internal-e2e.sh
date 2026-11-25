@@ -106,7 +106,7 @@ cleanup() {
   # before its output was read leaves a failure with nothing to read.
   if docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
     collect_openbao_log
-    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    docker rm -fv "$CONTAINER_NAME" >/dev/null 2>&1 || true
   fi
   # The whole scratch mount goes, the server key the container generated
   # with it.  The directory is ours and world-writable, so the unlink
@@ -151,7 +151,7 @@ chmod 777 "$TLS_DIR"
 
 log_phase "openbao-up"
 echo "[registrar-internal] image=$OPENBAO_IMAGE port=$OPENBAO_HOST_PORT" >>"$RUN_LOG"
-docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+docker rm -fv "$CONTAINER_NAME" >/dev/null 2>&1 || true
 docker run -d \
   --name "$CONTAINER_NAME" \
   -p "127.0.0.1:${OPENBAO_HOST_PORT}:8200" \

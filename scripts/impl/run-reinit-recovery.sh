@@ -722,7 +722,7 @@ scenario_c_rsync_clone_stale_state() {
   # Remove the container + named volume out-of-band so the carried-over
   # state.json keeps pointing at a "previous-host" OpenBao that no
   # longer exists locally — the canonical rsync-clone trap.
-  docker rm -f "$OPENBAO_CONTAINER_NAME" >/dev/null 2>&1 || true
+  docker rm -fv "$OPENBAO_CONTAINER_NAME" >/dev/null 2>&1 || true
   # bootroot passes an explicit `-p` on every `docker compose`
   # invocation, resolved from `--instance-name`, then COMPOSE_PROJECT_NAME,
   # then BOOTROOT_INSTANCE in the compose directory's .env, then the

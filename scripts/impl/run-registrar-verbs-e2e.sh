@@ -82,7 +82,7 @@ cleanup() {
   # before its output was read leaves a failure with nothing to read.
   if docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
     collect_openbao_log
-    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    docker rm -fv "$CONTAINER_NAME" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
@@ -115,7 +115,7 @@ OPENBAO_TOKEN="root-$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 
 log_phase "openbao-up"
 echo "[registrar-verbs] image=$OPENBAO_IMAGE port=$OPENBAO_HOST_PORT" >>"$RUN_LOG"
-docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+docker rm -fv "$CONTAINER_NAME" >/dev/null 2>&1 || true
 docker run -d \
   --name "$CONTAINER_NAME" \
   -p "127.0.0.1:${OPENBAO_HOST_PORT}:8200" \

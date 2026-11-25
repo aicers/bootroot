@@ -551,7 +551,7 @@ collect_dead_run_instance() {
   fi
   while IFS= read -r name; do
     [ -n "$name" ] || continue
-    docker rm -f "$name" >>"$log" 2>&1 || true
+    docker rm -fv "$name" >>"$log" 2>&1 || true
   done <<<"$existing"
   if ! existing="$(bootroot_leftover_containers "$instance")"; then
     echo "[${label}] cannot list this daemon's containers, so what the collection of dead run ${instance} removed is unknown; see the docker error above" >&2

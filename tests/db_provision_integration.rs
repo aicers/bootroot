@@ -93,8 +93,10 @@ mod unix_integration {
 
     impl Drop for PostgresContainer {
         fn drop(&mut self) {
+            // `-v`: `--rm` drops the image's anonymous data volume only
+            // when the container exits by itself, not on a forced removal.
             let _ = Command::new("docker")
-                .args(["rm", "-f", &self.name])
+                .args(["rm", "-fv", &self.name])
                 .output();
         }
     }
@@ -218,8 +220,10 @@ mod unix_integration {
 
     impl Drop for TlsPostgresContainer {
         fn drop(&mut self) {
+            // `-v`: `--rm` drops the image's anonymous data volume only
+            // when the container exits by itself, not on a forced removal.
             let _ = Command::new("docker")
-                .args(["rm", "-f", &self.name])
+                .args(["rm", "-fv", &self.name])
                 .output();
         }
     }
