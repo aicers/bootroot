@@ -1339,7 +1339,8 @@ pub(super) async fn trust_state_for_repair(
                 state.new_root_fp.clone(),
                 state.new_intermediate_fp.clone(),
             ],
-            bundle_pem: super::ca::concat_unique_ca_certs_for_repair(ctx, messages).await?,
+            bundle_pem: super::ca::concat_unique_ca_certs_for_repair(ctx, state.staged, messages)
+                .await?,
         });
     }
     let root_fp = active_root_fingerprint(&ctx.secrets, messages).await?;

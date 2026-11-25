@@ -1007,6 +1007,129 @@ impl Messages {
         )
     }
 
+    pub(crate) fn rotate_ca_key_phase_generate_root_staged(&self) -> &'static str {
+        self.strings().rotate_ca_key_phase_generate_root_staged
+    }
+
+    pub(crate) fn rotate_ca_key_phase_generate_staged(&self) -> &'static str {
+        self.strings().rotate_ca_key_phase_generate_staged
+    }
+
+    pub(crate) fn rotate_ca_key_paused_before_stepca(
+        &self,
+        path: &str,
+        fingerprint: &str,
+        pem: &str,
+    ) -> String {
+        format_template(
+            self.strings().rotate_ca_key_paused_before_stepca,
+            &[("path", path), ("fingerprint", fingerprint), ("pem", pem)],
+        )
+    }
+
+    pub(crate) fn error_rotation_pause_stepca_switched(&self, phase: &str) -> String {
+        format_template(
+            self.strings().error_rotation_pause_stepca_switched,
+            &[("phase", phase)],
+        )
+    }
+
+    pub(crate) fn error_rotation_pause_not_staged(&self, phase: &str) -> String {
+        format_template(
+            self.strings().error_rotation_pause_not_staged,
+            &[("phase", phase)],
+        )
+    }
+
+    pub(crate) fn error_rotation_pause_phase4_started(&self) -> &'static str {
+        self.strings().error_rotation_pause_phase4_started
+    }
+
+    pub(crate) fn error_staged_cert_not_new(
+        &self,
+        path: &str,
+        expected: &str,
+        actual: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_staged_cert_not_new,
+            &[("path", path), ("expected", expected), ("actual", actual)],
+        )
+    }
+
+    pub(crate) fn error_staged_chain_not_new_root(&self, cert: &str, root: &str) -> String {
+        format_template(
+            self.strings().error_staged_chain_not_new_root,
+            &[("cert", cert), ("root", root)],
+        )
+    }
+
+    pub(crate) fn error_staged_chain_old_root(&self, cert: &str, root: &str) -> String {
+        format_template(
+            self.strings().error_staged_chain_old_root,
+            &[("cert", cert), ("root", root)],
+        )
+    }
+
+    pub(crate) fn error_step_public_key_unreadable(&self, key: &str) -> String {
+        format_template(
+            self.strings().error_step_public_key_unreadable,
+            &[("key", key)],
+        )
+    }
+
+    pub(crate) fn error_staged_key_mismatch(&self, key: &str, cert: &str) -> String {
+        format_template(
+            self.strings().error_staged_key_mismatch,
+            &[("key", key), ("cert", cert)],
+        )
+    }
+
+    pub(crate) fn error_postgres_cert_not_new_generation(
+        &self,
+        cert: &str,
+        intermediate: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_postgres_cert_not_new_generation,
+            &[("cert", cert), ("intermediate", intermediate)],
+        )
+    }
+
+    pub(crate) fn error_stepca_switch_verification_failed(&self) -> &'static str {
+        self.strings().error_stepca_switch_verification_failed
+    }
+
+    pub(crate) fn rotate_ca_key_phase_switch_stepca(&self) -> &'static str {
+        self.strings().rotate_ca_key_phase_switch_stepca
+    }
+
+    pub(crate) fn rotate_ca_key_stepca_removing(&self) -> &'static str {
+        self.strings().rotate_ca_key_stepca_removing
+    }
+
+    pub(crate) fn rotate_ca_key_staged_moved(&self, staged: &str, live: &str) -> String {
+        format_template(
+            self.strings().rotate_ca_key_staged_moved,
+            &[("staged", staged), ("live", live)],
+        )
+    }
+
+    pub(crate) fn rotate_ca_key_staged_already_moved(&self, staged: &str) -> String {
+        format_template(
+            self.strings().rotate_ca_key_staged_already_moved,
+            &[("staged", staged)],
+        )
+    }
+
+    pub(crate) fn rotate_ca_key_postgres_reissue_new_generation(&self) -> &'static str {
+        self.strings().rotate_ca_key_postgres_reissue_new_generation
+    }
+
+    pub(crate) fn rotate_ca_key_stepca_starting(&self) -> &'static str {
+        self.strings().rotate_ca_key_stepca_starting
+    }
+
     pub(crate) fn info_infra_tls_renewed(&self, name: &str) -> String {
         format_template(self.strings().info_infra_tls_renewed, &[("name", name)])
     }

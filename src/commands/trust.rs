@@ -43,6 +43,23 @@ pub(crate) struct RotationState {
     pub(crate) old_intermediate_fp: String,
     pub(crate) new_intermediate_fp: String,
     pub(crate) phase: u8,
+    /// Whether this full rotation builds the new generation at staging
+    /// paths (`--pause-before-step-ca`) and moves it into place only in
+    /// Phase 4. Absent from a state file an older build wrote, which
+    /// reads as `false`: that rotation resumes exactly as before.
+    #[serde(default)]
+    pub(crate) staged: bool,
+    /// Whether Phase 4 of a staged rotation has begun changing anything:
+    /// written before step-ca is removed, so an interrupted Phase 4 is
+    /// told apart from a rotation paused after Phase 3.
+    #[serde(default)]
+    pub(crate) phase4_started: bool,
+    /// The restart policy step-ca's container carried when a staged
+    /// Phase 4 removed it, applied again to the container it recreates.
+    /// Recorded with `phase4_started`, so a resumed Phase 4 that finds
+    /// the container already gone still knows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) stepca_restart_policy: Option<String>,
 }
 
 /// Returns the path to `rotation-state.json` in the given directory.
@@ -292,7 +309,56 @@ mod tests {
             old_intermediate_fp: "bbb".to_string(),
             new_intermediate_fp: String::new(),
             phase: 0,
+            staged: false,
+            phase4_started: false,
+            stepca_restart_policy: None,
         }
+    }
+
+    /// A state file written before staging existed carries neither
+    /// field; both read as `false`, so that rotation resumes unstaged.
+    #[test]
+    fn load_rotation_state_without_staging_fields_reads_them_as_false() {
+        let dir = tempdir().expect("tempdir");
+        let messages = test_messages();
+        fs::write(
+            rotation_state_path(dir.path()),
+            r#"{"mode":"full","started_at":"2026-03-01T10:00:00Z","old_root_fp":"aaa","new_root_fp":"ccc","old_intermediate_fp":"bbb","new_intermediate_fp":"ddd","phase":3}"#,
+        )
+        .expect("write legacy state");
+
+        let loaded = load_rotation_state(dir.path(), &messages)
+            .expect("load")
+            .expect("should be Some");
+
+        assert_eq!(loaded.mode, RotationMode::Full);
+        assert_eq!(loaded.phase, 3);
+        assert!(!loaded.staged);
+        assert!(!loaded.phase4_started);
+        assert_eq!(loaded.stepca_restart_policy, None);
+    }
+
+    #[test]
+    fn staging_fields_round_trip() {
+        let dir = tempdir().expect("tempdir");
+        let messages = test_messages();
+        let mut state = sample_state();
+        state.mode = RotationMode::Full;
+        state.staged = true;
+        state.phase4_started = true;
+        state.stepca_restart_policy = Some("unless-stopped".to_string());
+
+        create_rotation_state(dir.path(), &state, &messages).expect("create");
+        let loaded = load_rotation_state(dir.path(), &messages)
+            .expect("load")
+            .expect("should be Some");
+
+        assert!(loaded.staged);
+        assert!(loaded.phase4_started);
+        assert_eq!(
+            loaded.stepca_restart_policy.as_deref(),
+            Some("unless-stopped")
+        );
     }
 
     #[test]

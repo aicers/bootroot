@@ -569,6 +569,30 @@ bootroot rotate \
   ca-key --full --cleanup
 ```
 
+CA 키 회전(전체), step-ca가 새 루트로 전환되기 전에 일시 중지 — 첫 번째 명령은
+Phase 3 이후에 멈추고 스테이징된 새 루트를 출력하며, 두 번째 명령은 새 루트가
+배포된 뒤 이어서 진행합니다:
+
+```bash
+bootroot rotate \
+  --compose-file docker-compose.yml \
+  --openbao-url http://localhost:8200 \
+  --auth-mode approle \
+  --approle-role-id "$ROTATE_ROLE_ID" \
+  --approle-secret-id "$ROTATE_SECRET_ID" \
+  --yes \
+  ca-key --full --pause-before-step-ca
+
+bootroot rotate \
+  --compose-file docker-compose.yml \
+  --openbao-url http://localhost:8200 \
+  --auth-mode approle \
+  --approle-role-id "$ROTATE_ROLE_ID" \
+  --approle-secret-id "$ROTATE_SECRET_ID" \
+  --yes \
+  ca-key --full
+```
+
 CA 키 회전 후 모든 서비스에 대해 인증서 강제 재발급:
 
 ```bash

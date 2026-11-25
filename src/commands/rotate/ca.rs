@@ -23,10 +23,10 @@ use crate::cli::args::{RotateCaKeyArgs, RotateForceReissueArgs, RotateSkipPhase}
 use crate::commands::compose_file::compose_file_dir;
 use crate::commands::compose_project::ComposeIdentity;
 use crate::commands::container_name::BootrootContainer;
-use crate::commands::infra::run_docker;
+use crate::commands::infra::run_docker_with_exec;
 use crate::commands::init::{
     POSTGRES_INFRA_CERT_KEY, compute_ca_bundle_pem, compute_ca_fingerprints, fingerprint_ca_cert,
-    issue_postgres_tls_cert, read_ca_cert_fingerprint,
+    issue_postgres_tls_cert,
 };
 use crate::commands::trust::{
     self, RotationMode, RotationState, create_rotation_state_async, delete_rotation_state,
@@ -34,6 +34,8 @@ use crate::commands::trust::{
 };
 use crate::i18n::Messages;
 use crate::state::{DeliveryMode, ServiceEntry, StateFile};
+
+mod staged;
 
 /// Cadence shared by `--wait` polling for both `remote-bootstrap` (KV
 /// payload) and `local-file` (cert on disk) delivery so operators see
@@ -79,15 +81,29 @@ pub(super) async fn rotate_ca_key(
 
     let mut start_phase: u8 = 0;
     let mut resumed = false;
-    let mut rot_state = if let Some(state) = load_rotation_state(&ctx.state_dir, messages)? {
-        if state.mode != expected_mode {
-            let mode_str = if state.mode == RotationMode::Full {
-                "full"
-            } else {
-                "intermediate-only"
-            };
-            anyhow::bail!(messages.error_rotation_mode_mismatch(mode_str));
-        }
+    let loaded_state = load_rotation_state(&ctx.state_dir, messages)?;
+    if let Some(state) = &loaded_state
+        && state.mode != expected_mode
+    {
+        let mode_str = if state.mode == RotationMode::Full {
+            "full"
+        } else {
+            "intermediate-only"
+        };
+        anyhow::bail!(messages.error_rotation_mode_mismatch(mode_str));
+    }
+    // Decided right after the state is read, before any file, container,
+    // ownership or state change: a refusal, or a repeated pause, leaves
+    // the host exactly as it found it.
+    let staging =
+        staged::decide_staging(loaded_state.as_ref(), args.pause_before_step_ca, messages)?;
+    if staging == staged::StagingDecision::RepeatPause
+        && let Some(state) = &loaded_state
+    {
+        println!("{}", staged::pause_notice(ctx, state, messages).await?);
+        return Ok(());
+    }
+    let mut rot_state = if let Some(state) = loaded_state {
         println!(
             "{}",
             messages.rotate_ca_key_resuming(&state.phase.to_string())
@@ -132,6 +148,9 @@ pub(super) async fn rotate_ca_key(
             old_intermediate_fp: current_inter_fp,
             new_intermediate_fp: String::new(),
             phase: 0,
+            staged: staging == staged::StagingDecision::Start { staged: true },
+            phase4_started: false,
+            stepca_restart_policy: None,
         }
     };
 
@@ -201,7 +220,13 @@ pub(super) async fn rotate_ca_key(
     }
 
     // Phase 2 — Generate new key pair(s)
-    if start_phase < 2 {
+    if start_phase < 2 && rot_state.staged {
+        // Phase 2a and 2b at the staging paths: the live files keep the
+        // old generation, which step-ca goes on reading, until Phase 4.
+        staged::generate_staged_generation(ctx, &mut rot_state, resumed, messages).await?;
+        rot_state.phase = 2;
+        update_rotation_state_async(&ctx.state_dir, &rot_state, messages).await?;
+    } else if start_phase < 2 {
         if rot_state.mode == RotationMode::Full {
             // Phase 2a — Generate new root CA
             println!("{}", messages.rotate_ca_key_phase_generate_root());
@@ -210,7 +235,7 @@ pub(super) async fn rotate_ca_key(
             if pre_root_fp != rot_state.old_root_fp && !rot_state.old_root_fp.is_empty() {
                 rot_state.new_root_fp = pre_root_fp;
             } else {
-                generate_new_root(ctx, messages)?;
+                generate_new_root(ctx, &LIVE_CA_TARGETS, messages)?;
                 rot_state.new_root_fp =
                     ca_cert_fingerprint(&ctx.secrets, &ctx.paths.root_cert(), messages).await?;
             }
@@ -223,7 +248,7 @@ pub(super) async fn rotate_ca_key(
         if pre_fp != rot_state.old_intermediate_fp && !rot_state.old_intermediate_fp.is_empty() {
             rot_state.new_intermediate_fp = pre_fp;
         } else {
-            generate_new_intermediate(ctx, messages)?;
+            generate_new_intermediate(ctx, &LIVE_CA_TARGETS, messages)?;
             let new_fp =
                 ca_cert_fingerprint(&ctx.secrets, &ctx.paths.intermediate_cert(), messages).await?;
             rot_state.new_intermediate_fp = new_fp;
@@ -243,13 +268,20 @@ pub(super) async fn rotate_ca_key(
         // intermediate on disk (and, in a full rotation, the new root in
         // place of the old one), and Phase 4 restarts step-ca. A failure
         // aborts before Phase 3 is recorded, and a resume repeats this.
-        reissue_postgres_tls_cert(
-            &ctx.state,
-            &compose_file_dir(&ctx.compose_file),
-            ctx.paths.secrets_dir(),
-            &ctx.docker,
-            messages,
-        )?;
+        //
+        // Not in a staged rotation: its live intermediate is still the
+        // old one, and a certificate issued under it would stop being
+        // trusted once Phase 6 drops the old generation. Phase 4 issues
+        // it under the new intermediate instead, once that is live.
+        if !rot_state.staged {
+            reissue_postgres_tls_cert(
+                &ctx.state,
+                &compose_file_dir(&ctx.compose_file),
+                ctx.paths.secrets_dir(),
+                &ctx.docker,
+                messages,
+            )?;
+        }
 
         let transitional_fps = if rot_state.mode == RotationMode::Full {
             vec![
@@ -271,12 +303,20 @@ pub(super) async fn rotate_ca_key(
         // `bootroot verify` run mid-rotation would fail its fingerprint
         // check. Include the Phase-1 backups so the bundle carries both
         // generations, matching the pins.
-        let mut bundle_sources = vec![ctx.paths.root_cert()];
-        if rot_state.mode == RotationMode::Full {
-            bundle_sources.push(ctx.paths.root_cert_bak());
-        }
-        bundle_sources.push(ctx.paths.intermediate_cert_bak());
-        bundle_sources.push(ctx.paths.intermediate_cert());
+        //
+        // A staged rotation has the new generation at the staging paths
+        // and the old one still live, so it reads them from there.
+        let bundle_sources = if rot_state.staged {
+            staged::phase3_bundle_sources(&ctx.paths)
+        } else {
+            let mut sources = vec![ctx.paths.root_cert()];
+            if rot_state.mode == RotationMode::Full {
+                sources.push(ctx.paths.root_cert_bak());
+            }
+            sources.push(ctx.paths.intermediate_cert_bak());
+            sources.push(ctx.paths.intermediate_cert());
+            sources
+        };
         let ca_bundle_pem = concat_unique_ca_certs(&ctx.secrets, &bundle_sources, messages).await?;
         // Enumerated here, inside the phase, so a resumed rotation sees
         // identities minted since the run that failed; a failure aborts
@@ -341,10 +381,28 @@ pub(super) async fn rotate_ca_key(
         println!("{}", messages.rotate_ca_key_phase_skipped("3"));
     }
 
+    // `--pause-before-step-ca`: the new generation is staged and its
+    // trust distributed, and step-ca still runs on the old one. A run
+    // without the flag continues from Phase 4.
+    if args.pause_before_step_ca && rot_state.staged {
+        println!("{}", staged::pause_notice(ctx, &rot_state, messages).await?);
+        return Ok(());
+    }
+
     // Phase 4 — Restart step-ca
     if start_phase < 4 {
-        println!("{}", messages.rotate_ca_key_phase_restart_stepca());
-        restart_compose_service(&ctx.compose_file, "step-ca", messages)?;
+        if rot_state.staged {
+            // Moves the staged generation into place with step-ca
+            // removed, and brings it back only once all four files and
+            // the PostgreSQL certificate are proven to be the new
+            // generation.
+            println!("{}", messages.rotate_ca_key_phase_switch_stepca());
+            let switch = staged::DockerStepCaSwitch::prepare(ctx, messages)?;
+            staged::switch_to_staged_generation(ctx, &mut rot_state, &switch, messages).await?;
+        } else {
+            println!("{}", messages.rotate_ca_key_phase_restart_stepca());
+            restart_compose_service(&ctx.compose_file, "step-ca", messages)?;
+        }
 
         // The mandatory tail. Unnumbered on purpose — renumbering the
         // phases would break every operator runbook and every resume of
@@ -364,8 +422,9 @@ pub(super) async fn rotate_ca_key(
             )?;
             // The live certificates already hold the new generation, so
             // the Phase-1 backups are what carry the old one — the same
-            // sources Phase 3 concatenated.
-            let bundle_pem = concat_unique_ca_certs_for_repair(ctx, messages).await?;
+            // bytes Phase 3 concatenated.
+            let bundle_pem =
+                concat_unique_ca_certs_for_repair(ctx, rot_state.staged, messages).await?;
             // Not reloaded here. Phase 5 moves the endpoint's surface
             // leaves, and its one reload also picks up this credential;
             // a second one sent here could still be running when Phase 5
@@ -841,21 +900,37 @@ fn surface_wait_budget() -> WaitBudget {
 /// Exactly the sources Phase 3 concatenated, so a recovery run and the
 /// rotation that preceded it cannot publish different bytes for the same
 /// generation pair.
+///
+/// An unstaged rotation put the new generation at the live paths in
+/// Phase 2, so the Phase-1 backups carry the old one. A `staged` rotation
+/// keeps the old generation live until Phase 4, so the old generation is
+/// read from the backups — the same bytes Phase 3 read from the live
+/// paths — and the new one from each staging path while its file is
+/// still there, otherwise from the live path Phase 4 moved it to. A
+/// repair run while paused, or between two of Phase 4's moves, therefore
+/// still publishes both generations.
 pub(super) async fn concat_unique_ca_certs_for_repair(
     ctx: &RotateContext,
+    staged: bool,
     messages: &Messages,
 ) -> Result<String> {
-    concat_unique_ca_certs(
-        &ctx.secrets,
-        &[
-            ctx.paths.root_cert(),
-            ctx.paths.root_cert_bak(),
-            ctx.paths.intermediate_cert_bak(),
-            ctx.paths.intermediate_cert(),
-        ],
-        messages,
-    )
-    .await
+    let paths = &ctx.paths;
+    let sources: Vec<Vec<PathBuf>> = if staged {
+        vec![
+            vec![paths.root_cert_staged(), paths.root_cert()],
+            vec![paths.root_cert_bak()],
+            vec![paths.intermediate_cert_bak()],
+            vec![paths.intermediate_cert_staged(), paths.intermediate_cert()],
+        ]
+    } else {
+        vec![
+            vec![paths.root_cert()],
+            vec![paths.root_cert_bak()],
+            vec![paths.intermediate_cert_bak()],
+            vec![paths.intermediate_cert()],
+        ]
+    };
+    concat_unique_ca_cert_sources(&ctx.secrets, &sources, messages).await
 }
 
 /// The additive trust set a full rotation publishes in Phase 3 and
@@ -885,55 +960,105 @@ fn transitional_fingerprints(state: &RotationState) -> Vec<String> {
 /// both the fingerprint and the bundled bytes come from that one read.
 async fn concat_unique_ca_certs(
     tree: &Arc<SecretsTree>,
-    paths: &[std::path::PathBuf],
+    paths: &[PathBuf],
+    messages: &Messages,
+) -> Result<String> {
+    let sources: Vec<Vec<PathBuf>> = paths.iter().map(|path| vec![path.clone()]).collect();
+    concat_unique_ca_cert_sources(tree, &sources, messages).await
+}
+
+/// [`concat_unique_ca_certs`] where each certificate of the bundle is the
+/// first of its candidate paths that exists.
+///
+/// Only an absent candidate passes to the next: anything else a read
+/// returns — a link refused through a rooted `tree`, a file that does not
+/// parse — fails the bundle as a single path would. A source none of
+/// whose candidates exists is the missing-file error, naming its last
+/// candidate. Each candidate is read once, and its fingerprint and
+/// bundled bytes come from that one read, so a file renamed from one
+/// candidate to the next between two reads is still found.
+async fn concat_unique_ca_cert_sources(
+    tree: &Arc<SecretsTree>,
+    sources: &[Vec<PathBuf>],
     messages: &Messages,
 ) -> Result<String> {
     if tree.is_rooted() {
-        let paths = paths.to_vec();
+        let sources = sources.to_vec();
         let messages = messages.clone();
         return tree
-            .run(move |tree| concat_unique_ca_certs_rooted(tree, &paths, &messages))
+            .run(move |tree| {
+                concat_unique_ca_cert_sources_with(&sources, &messages, |path| tree.read(path))
+            })
             .await;
     }
-    let mut bundle = String::new();
-    let mut seen: Vec<String> = Vec::new();
-    for path in paths {
-        let fingerprint = read_ca_cert_fingerprint(path, messages).await?;
-        if seen.contains(&fingerprint) {
-            continue;
-        }
-        seen.push(fingerprint);
-        let pem = tokio::fs::read_to_string(path)
-            .await
-            .with_context(|| messages.error_read_file_failed(&path.display().to_string()))?;
-        bundle.push_str(&pem);
-        if !bundle.ends_with('\n') {
-            bundle.push('\n');
-        }
+    let mut read = Vec::with_capacity(sources.len());
+    for candidates in sources {
+        read.push(read_first_present_async(candidates, messages).await?);
     }
-    Ok(bundle)
+    bundle_unique_ca_certs(read, messages)
 }
 
-/// [`concat_unique_ca_certs`] through a rooted `tree`. Blocking.
-fn concat_unique_ca_certs_rooted(
-    tree: &SecretsTree,
-    paths: &[std::path::PathBuf],
+/// Reads the first of `candidates` that exists, by path. Returns the
+/// path read and its contents.
+async fn read_first_present_async(
+    candidates: &[PathBuf],
     messages: &Messages,
-) -> Result<String> {
-    let mut bundle = String::new();
-    let mut seen: Vec<String> = Vec::new();
-    for path in paths {
-        let contents = match tree.read(path) {
-            Ok(contents) => contents,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                anyhow::bail!(messages.error_ca_cert_missing(&path.display().to_string()));
-            }
+) -> Result<(PathBuf, Vec<u8>)> {
+    for path in candidates {
+        match tokio::fs::read(path).await {
+            Ok(contents) => return Ok((path.clone(), contents)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
                 return Err(anyhow::Error::new(err)
                     .context(messages.error_read_file_failed(&path.display().to_string())));
             }
-        };
-        let fingerprint = fingerprint_ca_cert(&contents, path, messages)?;
+        }
+    }
+    anyhow::bail!(messages.error_ca_cert_missing(&last_candidate(candidates)))
+}
+
+/// [`concat_unique_ca_cert_sources`] with each candidate read by `read`.
+/// Blocking.
+fn concat_unique_ca_cert_sources_with(
+    sources: &[Vec<PathBuf>],
+    messages: &Messages,
+    read: impl Fn(&Path) -> std::io::Result<Vec<u8>>,
+) -> Result<String> {
+    let mut contents = Vec::with_capacity(sources.len());
+    'sources: for candidates in sources {
+        for path in candidates {
+            match read(path) {
+                Ok(bytes) => {
+                    contents.push((path.clone(), bytes));
+                    continue 'sources;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(anyhow::Error::new(err)
+                        .context(messages.error_read_file_failed(&path.display().to_string())));
+                }
+            }
+        }
+        anyhow::bail!(messages.error_ca_cert_missing(&last_candidate(candidates)));
+    }
+    bundle_unique_ca_certs(contents, messages)
+}
+
+/// The display of the last of `candidates`, which the missing-file error
+/// names.
+fn last_candidate(candidates: &[PathBuf]) -> String {
+    candidates
+        .last()
+        .map_or_else(String::new, |path| path.display().to_string())
+}
+
+/// Concatenates certificates already read, skipping duplicates by DER
+/// SHA-256 (first occurrence wins).
+fn bundle_unique_ca_certs(read: Vec<(PathBuf, Vec<u8>)>, messages: &Messages) -> Result<String> {
+    let mut bundle = String::new();
+    let mut seen: Vec<String> = Vec::new();
+    for (path, contents) in read {
+        let fingerprint = fingerprint_ca_cert(&contents, &path, messages)?;
         if seen.contains(&fingerprint) {
             continue;
         }
@@ -975,10 +1100,41 @@ fn owner_user_arg(secrets_dir: &Path, messages: &Messages) -> Result<String> {
     Ok(format!("{}:{}", meta.uid(), meta.gid()))
 }
 
+/// Where `step certificate create` writes one CA generation, as the
+/// helper container sees `secrets/` mounted at `/home/step`.
+///
+/// The intermediate is always signed by the root of the same targets:
+/// the live root for an unstaged rotation (the new one, in a full
+/// rotation, once Phase 2a has replaced it), the staged new root for a
+/// staged one.
+pub(super) struct CaFileTargets {
+    pub(super) root_cert: &'static str,
+    pub(super) root_key: &'static str,
+    pub(super) intermediate_cert: &'static str,
+    pub(super) intermediate_key: &'static str,
+}
+
+/// The live CA files, which step-ca's `ca.json` names.
+pub(super) const LIVE_CA_TARGETS: CaFileTargets = CaFileTargets {
+    root_cert: "/home/step/certs/root_ca.crt",
+    root_key: "/home/step/secrets/root_ca_key",
+    intermediate_cert: "/home/step/certs/intermediate_ca.crt",
+    intermediate_key: "/home/step/secrets/intermediate_ca_key",
+};
+
+/// The staging paths of a staged full rotation: each live name followed
+/// by [`super::STAGED_CA_FILE_SUFFIX`], which a test holds these to.
+pub(super) const STAGED_CA_TARGETS: CaFileTargets = CaFileTargets {
+    root_cert: "/home/step/certs/root_ca.crt.staged",
+    root_key: "/home/step/secrets/root_ca_key.staged",
+    intermediate_cert: "/home/step/certs/intermediate_ca.crt.staged",
+    intermediate_key: "/home/step/secrets/intermediate_ca_key.staged",
+};
+
 /// Builds the `docker run` argv that regenerates the root CA as the
-/// secrets-directory owner. Kept pure so tests can assert it carries
-/// `--user <uid>:<gid>` rather than `--user root`.
-fn generate_root_docker_args(mount: &str, user_arg: &str) -> Vec<String> {
+/// secrets-directory owner, at `targets`. Kept pure so tests can assert
+/// it carries `--user <uid>:<gid>` rather than `--user root`.
+fn generate_root_docker_args(mount: &str, user_arg: &str, targets: &CaFileTargets) -> Vec<String> {
     [
         "run",
         "--user",
@@ -991,8 +1147,8 @@ fn generate_root_docker_args(mount: &str, user_arg: &str) -> Vec<String> {
         "certificate",
         "create",
         ROOT_CA_COMMON_NAME,
-        "/home/step/certs/root_ca.crt",
-        "/home/step/secrets/root_ca_key",
+        targets.root_cert,
+        targets.root_key,
         "--profile",
         "root-ca",
         "--password-file",
@@ -1005,9 +1161,14 @@ fn generate_root_docker_args(mount: &str, user_arg: &str) -> Vec<String> {
 }
 
 /// Builds the `docker run` argv that regenerates the intermediate CA as
-/// the secrets-directory owner. Kept pure so tests can assert it carries
-/// `--user <uid>:<gid>` rather than `--user root`.
-fn generate_intermediate_docker_args(mount: &str, user_arg: &str) -> Vec<String> {
+/// the secrets-directory owner, at `targets` and signed by the root of
+/// `targets`. Kept pure so tests can assert it carries `--user
+/// <uid>:<gid>` rather than `--user root`.
+fn generate_intermediate_docker_args(
+    mount: &str,
+    user_arg: &str,
+    targets: &CaFileTargets,
+) -> Vec<String> {
     [
         "run",
         "--user",
@@ -1020,14 +1181,14 @@ fn generate_intermediate_docker_args(mount: &str, user_arg: &str) -> Vec<String>
         "certificate",
         "create",
         INTERMEDIATE_CA_COMMON_NAME,
-        "/home/step/certs/intermediate_ca.crt",
-        "/home/step/secrets/intermediate_ca_key",
+        targets.intermediate_cert,
+        targets.intermediate_key,
         "--profile",
         "intermediate-ca",
         "--ca",
-        "/home/step/certs/root_ca.crt",
+        targets.root_cert,
         "--ca-key",
-        "/home/step/secrets/root_ca_key",
+        targets.root_key,
         "--password-file",
         "/home/step/password.txt",
         "--ca-password-file",
@@ -1039,28 +1200,48 @@ fn generate_intermediate_docker_args(mount: &str, user_arg: &str) -> Vec<String>
     .collect()
 }
 
-fn generate_new_root(ctx: &RotateContext, messages: &Messages) -> Result<()> {
+/// The `-v` mount and `--user` value every `step` helper container
+/// against `secrets/` runs with.
+pub(super) fn step_helper_mount_and_user(
+    ctx: &RotateContext,
+    messages: &Messages,
+) -> Result<(String, String)> {
     let secrets_dir = ctx.paths.secrets_dir();
     let mount_root = fs::canonicalize(secrets_dir)
         .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
     let mount = format!("{}:/home/step", mount_root.display());
     let user_arg = owner_user_arg(secrets_dir, messages)?;
-    let args = generate_root_docker_args(&mount, &user_arg);
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_docker(&arg_refs, "docker step certificate create (root)", messages)?;
-    Ok(())
+    Ok((mount, user_arg))
 }
 
-fn generate_new_intermediate(ctx: &RotateContext, messages: &Messages) -> Result<()> {
-    let secrets_dir = ctx.paths.secrets_dir();
-    let mount_root = fs::canonicalize(secrets_dir)
-        .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
-    let mount = format!("{}:/home/step", mount_root.display());
-    let user_arg = owner_user_arg(secrets_dir, messages)?;
-    let args = generate_intermediate_docker_args(&mount, &user_arg);
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_docker(&arg_refs, "docker step certificate create", messages)?;
-    Ok(())
+pub(super) fn generate_new_root(
+    ctx: &RotateContext,
+    targets: &CaFileTargets,
+    messages: &Messages,
+) -> Result<()> {
+    let (mount, user_arg) = step_helper_mount_and_user(ctx, messages)?;
+    let args = generate_root_docker_args(&mount, &user_arg, targets);
+    run_docker_with_exec(
+        &args,
+        "docker step certificate create (root)",
+        &ctx.docker,
+        messages,
+    )
+}
+
+pub(super) fn generate_new_intermediate(
+    ctx: &RotateContext,
+    targets: &CaFileTargets,
+    messages: &Messages,
+) -> Result<()> {
+    let (mount, user_arg) = step_helper_mount_and_user(ctx, messages)?;
+    let args = generate_intermediate_docker_args(&mount, &user_arg, targets);
+    run_docker_with_exec(
+        &args,
+        "docker step certificate create",
+        &ctx.docker,
+        messages,
+    )
 }
 
 /// Copies the CA file `src` to its backup `dst`, both below the secrets
@@ -1998,6 +2179,9 @@ mod tests {
             old_intermediate_fp: String::new(),
             new_intermediate_fp: String::new(),
             phase: 6,
+            staged: false,
+            phase4_started: false,
+            stepca_restart_policy: None,
         };
         fs::write(
             crate::commands::trust::rotation_state_path(&ctx.state_dir),
@@ -2040,6 +2224,9 @@ mod tests {
                 old_intermediate_fp: "c".repeat(64),
                 new_intermediate_fp: "d".repeat(64),
                 phase: recorded,
+                staged: false,
+                phase4_started: false,
+                stepca_restart_policy: None,
             };
             create_rotation_state_async(&ctx.state_dir, &state, &messages)
                 .await
@@ -2595,7 +2782,8 @@ mod tests {
     /// `root` — otherwise the regenerated key would land root-owned.
     #[test]
     fn generate_root_docker_args_run_as_owner_not_root() {
-        let args = generate_root_docker_args("/host/secrets:/home/step", "1000:1000");
+        let args =
+            generate_root_docker_args("/host/secrets:/home/step", "1000:1000", &LIVE_CA_TARGETS);
         let user_pos = args
             .iter()
             .position(|a| a == "--user")
@@ -2612,7 +2800,11 @@ mod tests {
     /// secrets-directory owner rather than `root`.
     #[test]
     fn generate_intermediate_docker_args_run_as_owner_not_root() {
-        let args = generate_intermediate_docker_args("/host/secrets:/home/step", "1000:1000");
+        let args = generate_intermediate_docker_args(
+            "/host/secrets:/home/step",
+            "1000:1000",
+            &LIVE_CA_TARGETS,
+        );
         let user_pos = args
             .iter()
             .position(|a| a == "--user")
@@ -2634,11 +2826,11 @@ mod tests {
         for (source, args) in [
             (
                 "rotate ca-key root regeneration",
-                generate_root_docker_args(mount, "1000:1000"),
+                generate_root_docker_args(mount, "1000:1000", &LIVE_CA_TARGETS),
             ),
             (
                 "rotate ca-key intermediate regeneration",
-                generate_intermediate_docker_args(mount, "1000:1000"),
+                generate_intermediate_docker_args(mount, "1000:1000", &LIVE_CA_TARGETS),
             ),
         ] {
             let image = args

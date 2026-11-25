@@ -65,6 +65,13 @@ pub(crate) const REGISTRAR_CLIENT_RETIRED_DIR: &str = "registrar-client-retired"
 /// The staging name [`REGISTRAR_CLIENT_RETIRED_DIR`] is written under
 /// before it is renamed into place.
 pub(crate) const REGISTRAR_CLIENT_RETIRED_STAGING_DIR: &str = "registrar-client-retired.staging";
+/// Appended to the name of each live CA file to give the path a staged
+/// full rotation (`--pause-before-step-ca`) builds its counterpart at,
+/// in the same directory, so Phase 4 moves it into place by a rename.
+///
+/// step-ca's `ca.json` names the live files only, so nothing it reads
+/// ends in this suffix.
+pub(super) const STAGED_CA_FILE_SUFFIX: &str = ".staged";
 pub(super) const OPENBAO_RECOVERY_SCOPE_UNSEAL_KEYS: &str = "unseal-keys";
 pub(super) const OPENBAO_RECOVERY_SCOPE_ROOT_TOKEN: &str = "root-token";
 pub(super) const OPENBAO_ROOT_ROTATION_INCOMPLETE_ERROR: &str =
@@ -150,6 +157,22 @@ impl StatePaths {
             .join("intermediate_ca_key.bak")
     }
 
+    pub(super) fn root_cert_staged(&self) -> PathBuf {
+        staged_path(&self.root_cert())
+    }
+
+    pub(super) fn root_key_staged(&self) -> PathBuf {
+        staged_path(&self.stepca_root_key())
+    }
+
+    pub(super) fn intermediate_cert_staged(&self) -> PathBuf {
+        staged_path(&self.intermediate_cert())
+    }
+
+    pub(super) fn intermediate_key_staged(&self) -> PathBuf {
+        staged_path(&self.stepca_intermediate_key())
+    }
+
     pub(super) fn registrar_client_retired(&self) -> PathBuf {
         self.secrets_dir.join(REGISTRAR_CLIENT_RETIRED_DIR)
     }
@@ -157,6 +180,16 @@ impl StatePaths {
     pub(super) fn registrar_client_retired_staging(&self) -> PathBuf {
         self.secrets_dir.join(REGISTRAR_CLIENT_RETIRED_STAGING_DIR)
     }
+}
+
+/// The staging path of the live CA file `live`: the same directory, the
+/// name followed by [`STAGED_CA_FILE_SUFFIX`].
+fn staged_path(live: &Path) -> PathBuf {
+    let mut name = live
+        .file_name()
+        .map_or_else(std::ffi::OsString::new, std::ffi::OsStr::to_os_string);
+    name.push(STAGED_CA_FILE_SUFFIX);
+    live.with_file_name(name)
 }
 
 #[derive(Debug)]

@@ -2547,8 +2547,12 @@ Phases:
   registrar-managed identity — so services accept both old and new
   certificates and `bootroot verify` passes while the rotation is in
   flight
+  (a rotation started with `--pause-before-step-ca` re-issues the
+  PostgreSQL certificate in Phase 4 instead; see
+  [Pausing before step-ca switches](#pausing-before-step-ca-switches))
 - Phase 4 — Restart step-ca: restart the step-ca container so it uses the
-  new key pair
+  new key pair (a rotation started with `--pause-before-step-ca` moves the
+  staged generation into place and recreates step-ca instead)
 - Phase 5 — Re-issue: delete service cert/key files and signal the
   bootroot-agent host daemon (SIGHUP) to trigger re-issuance with the
   new CA. Remote-bootstrap services publish
@@ -2660,6 +2664,104 @@ throughout:
   `bootroot rotate infra-cert` before resuming. Phase 7 deletes
   `registrar-client-retired/` whether or not `--cleanup` is given.
 
+##### Pausing before step-ca switches
+
+`--pause-before-step-ca` stages a full rotation's new generation and
+stops after Phase 3, before step-ca starts issuing under the new root, so
+the new root can first be handed to systems that adopt it on their own
+schedule. It is valid only with `--full`, and cannot be combined with
+`--skip`, `--force` or `--cleanup`; any other combination is an argument
+error and changes nothing.
+
+- Phase 2 builds the new generation at staging paths, each in the same
+  directory as its live counterpart:
+  `secrets/certs/root_ca.crt.staged`, `secrets/secrets/root_ca_key.staged`,
+  `secrets/certs/intermediate_ca.crt.staged` and
+  `secrets/secrets/intermediate_ca_key.staged`. The new intermediate is
+  signed by the staged new root. The live files — the only ones step-ca's
+  `ca.json` names — keep the old generation, so a step-ca restarted while
+  the rotation is paused (a reboot, a container restart) still issues
+  under the old root.
+- Phase 3 publishes the same transitional trust as any full rotation,
+  reading the new generation from the staging paths and the old one from
+  the live paths, so services trust both generations while the rotation
+  is paused. It does not re-issue the PostgreSQL certificate; Phase 4 does.
+- The run then stops and exits successfully. It prints the path of the
+  staged new root certificate, its SHA-256 fingerprint (of the DER
+  encoding, lowercase hex), the certificate itself as PEM, and the
+  command that continues the rotation: `bootroot rotate ca-key --full`.
+- Running `rotate ca-key --full --pause-before-step-ca` again while the
+  rotation is paused changes nothing and prints the same output. With
+  the flag, the command refuses, before it changes anything: a rotation
+  whose Phase 4 has started (continue it with `bootroot rotate ca-key
+  --full`, without the flag), a rotation at Phase 4 or later (step-ca has
+  already been switched), and a rotation in progress that was started
+  without the flag.
+- `bootroot rotate ca-key --full`, without the flag, continues the
+  rotation. Phase 4 of a staged rotation:
+  1. records in `rotation-state.json` that Phase 4 has started, together
+     with the step-ca container's restart policy;
+  2. stops and removes the step-ca container
+     (`docker compose rm -sf step-ca`). A merely stopped container would
+     come back on a host or Docker daemon restart through
+     `restart: always`; a removed one cannot;
+  3. moves each staged file onto its live path by a rename, in this
+     order: root certificate, root key, intermediate key, intermediate
+     certificate. The `.bak` backups are left as they are;
+  4. issues the PostgreSQL server certificate under the new intermediate,
+     when `state.json` → `infra_certs` has a `postgres` entry, and reloads
+     PostgreSQL with `SIGHUP`. step-ca connects to PostgreSQL with
+     `sslmode=verify-full` against the single live root, so PostgreSQL
+     has to present a new-generation certificate before step-ca starts.
+     This runs `step` offline and does not need step-ca;
+  5. verifies that the live root and intermediate certificates are the
+     new ones `rotation-state.json` records, that each live key belongs
+     to its certificate, and that the PostgreSQL certificate is issued by
+     the new intermediate. Only then does it recreate step-ca with
+     `docker compose up -d --no-deps step-ca`, passing the compose files
+     `bootroot infra up` passes for step-ca — the base compose file and,
+     when `state.json` records `stepca_bind_addr`, the step-ca
+     exposed-port override — and put back the recorded restart policy
+     with `docker update --restart`, as `infra up --restart-policy` does.
+     When verification fails, step-ca is not started and the command
+     exits with an error.
+
+  The rest — the registrar-internal step after Phase 4 on an endpoint
+  host, and Phases 5 to 7 — runs as in any full rotation. Each step of
+  Phase 4 is safe to repeat, so re-running `bootroot rotate ca-key --full`
+  after an interruption anywhere in it finishes Phase 4 and the rotation.
+- If Phase 4 is interrupted between removing the step-ca container and
+  starting it again, step-ca stays absent, and no certificates are
+  issued, until `bootroot rotate ca-key --full` is run again to finish.
+- In that window, `docker compose up` or `bootroot infra up` on the
+  bootroot stack recreates step-ca: it is a default service of the stack,
+  and `prometheus`, under the `lan` and `public` profiles, has
+  `depends_on: step-ca`. The order of the moves bounds what such a step-ca
+  can do. Before the last move it finds either the old intermediate with
+  its old key, and issues under the old generation, or the new
+  intermediate key with the old intermediate certificate, and fails to
+  start or cannot produce verifiable certificates. Issuance under the new
+  generation is possible only once the last move is done. Re-running
+  `bootroot rotate ca-key --full` removes that container again and
+  finishes.
+- Continuing a paused rotation with a bootroot older than the release
+  that added `--pause-before-step-ca` is not supported.
+
+With Clumit Endpoint endpoints, a root rotation runs in this order:
+
+1. Run `bootroot rotate ca-key --full --pause-before-step-ca`.
+2. Paste the printed new root PEM into aice-web-next's root rotation
+   screen, and confirm the fingerprint there matches the one bootroot
+   printed.
+3. Let aice-web-next distribute address documents carrying both roots,
+   and watch the adoption ratio there.
+4. Run `bootroot rotate ca-key --full` to continue. Endpoints that have
+   not adopted the new root by then must be reinstalled.
+5. After the rotation completes, remove the old root in aice-web-next.
+
+[Pausing a full CA rotation for Clumit Endpoint](operations.md#pausing-a-full-ca-rotation-for-clumit-endpoint)
+describes this procedure in the operations guide.
+
 Inputs:
 
 - `--full`: rotate both root and intermediate CA keys (default:
@@ -2671,6 +2773,11 @@ Inputs:
   whose certificate does not both name the new intermediate as its issuer
   and carry that intermediate's signature
 - `--cleanup`: delete backup files on completion (Phase 7)
+- `--pause-before-step-ca`: build the new generation at staging paths
+  and stop after Phase 3, before step-ca is switched to the new root.
+  Requires `--full`; cannot be combined with `--skip`, `--force` or
+  `--cleanup`. See
+  [Pausing before step-ca switches](#pausing-before-step-ca-switches)
 - `--registrar-socket-unit <path>`: socket unit to read the registrar
   endpoint's `ListenStream=` from, exactly as
   `registrar capabilities --socket-unit` does. Used only by a full

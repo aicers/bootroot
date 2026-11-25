@@ -3828,6 +3828,45 @@ bootroot rotate trust-sync --yes
 [`secret_id`가 만료된 원격 호스트
 복구](#recovering-a-remote-host-whose-secret_id-expired)를 참고하세요.
 
+## Clumit Endpoint를 위한 전체 CA 회전 일시 중지 {#pausing-a-full-ca-rotation-for-clumit-endpoint}
+
+Clumit Endpoint 엔드포인트는 aice-web-next가 배포하는 서명된 주소 문서를
+통해서만 bootroot의 루트 CA를 신뢰합니다. 그래서 전체 회전
+(`bootroot rotate ca-key --full`)은 충분한 엔드포인트가 새 루트를 채택할
+때까지 step-ca가 새 루트로 발급을 시작하기 전에 멈춰야 합니다.
+`--pause-before-step-ca`가 그 멈춤입니다. 새 세대는 스테이징 경로에
+만들어지고, step-ca는 재시작되더라도 현재 루트로 계속 발급하며, 회전은
+옵션 없이 다시 실행해야만 이어서 진행됩니다. 스테이징 경로, 일시 중지 출력,
+Phase 4는 [CLI > rotate ca-key](cli.md#pausing-before-step-ca-switches)에
+자세히 설명되어 있습니다.
+
+루트는 다음 순서로 회전합니다:
+
+1. `bootroot rotate ca-key --full --pause-before-step-ca`를 실행합니다.
+   Phase 3 이후에 멈추고, 스테이징된 새 루트 인증서의 경로, SHA-256 지문,
+   PEM을 출력합니다.
+2. 출력된 새 루트 PEM을 aice-web-next의 루트 회전 화면에 붙여 넣고,
+   aice-web-next가 보여 주는 지문이 bootroot가 출력한 지문과 일치하는지
+   확인합니다.
+3. aice-web-next가 두 루트를 모두 담은 주소 문서를 배포하게 하고, 충분한
+   엔드포인트가 새 루트를 채택할 때까지 그곳에서 채택 비율을 지켜봅니다.
+4. `bootroot rotate ca-key --full`을 실행해 이어서 진행합니다. 그때까지 새
+   루트를 채택하지 않은 엔드포인트는 step-ca가 새 루트로 발급하기 시작하면
+   연결을 잃으므로 다시 설치해야 합니다.
+5. 회전이 끝나면 aice-web-next에서 이전 루트를 제거합니다.
+
+이어서 진행하는 실행의 Phase 4는 스테이징된 파일을 옮기기 전에 step-ca
+컨테이너를 제거하고, 새 세대를 확인한 뒤에야 다시 시작합니다. 그 사이에
+실행이 중단되면 `bootroot rotate ca-key --full`을 다시 실행해 마칠 때까지
+step-ca는 없는 상태로 남고 아무것도 발급되지 않습니다. 그 사이에 bootroot
+스택에서 `docker compose up`이나 `bootroot infra up`을 실행하면 step-ca가
+다시 생성됩니다(step-ca는 스택의 기본 서비스이고, `lan`과 `public`
+프로필의 `prometheus`가 `depends_on: step-ca`를 갖습니다). 파일을 옮기는
+순서 덕분에 그런 step-ca는 섞인 세대로 발급하지 않습니다. 마지막 이동
+전까지는 이전 세대로 발급하거나, 시작하지 못하거나 검증 가능한 인증서를
+만들지 못하며, 모든 파일이 제자리에 놓인 뒤에야 새 세대로 발급할 수
+있습니다.
+
 ## 강제 재발급
 
 서비스의 인증서/키를 삭제하고 bootroot-agent가 재발급하도록 하려면:

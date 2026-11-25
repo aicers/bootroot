@@ -2442,8 +2442,12 @@ step-ca가 사용하는 CA 키 쌍을 회전합니다. 기본 동작은 중간 C
   세대를 모두 담은 `ca-bundle.pem`)를 OpenBao(`bootroot/ca`, 모든
   `state.json` 서비스, 모든 registrar 관리 identity)에 기록해 서비스가
   기존/신규 인증서를 모두 수락하고 회전이 진행 중인 동안에도 `bootroot
-  verify`가 통과하도록 함
+  verify`가 통과하도록 함(`--pause-before-step-ca`로 시작한 회전은
+  PostgreSQL 인증서를 Phase 4에서 재발급합니다.
+  [step-ca 전환 전 일시 중지](#pausing-before-step-ca-switches) 참고)
 - Phase 4 — step-ca 재시작: step-ca 컨테이너를 재시작해 새 키 쌍 적용
+  (`--pause-before-step-ca`로 시작한 회전은 대신 스테이징된 세대를 제자리로
+  옮기고 step-ca를 다시 생성합니다)
 - Phase 5 — 재발급: 서비스 cert/key 삭제 후 bootroot-agent 호스트 데몬에
   시그널(SIGHUP)을 보내 새 CA로 재발급 유도. remote-bootstrap 서비스의
   경우 버전 관리된 재발급 요청을 OpenBao KV에 기록하며, 원격 agent가
@@ -2544,6 +2548,97 @@ Phase 3과 Phase 6도 해당 자격증명의 전용 trust 번들과 핀을 각�
   infra-cert`로 신규 CA 아래에서 다시 발급하세요. Phase 7은 `--cleanup`
   여부와 관계없이 `registrar-client-retired/`를 삭제합니다.
 
+##### step-ca 전환 전 일시 중지 {#pausing-before-step-ca-switches}
+
+`--pause-before-step-ca`는 전체 회전의 새 세대를 스테이징하고, step-ca가
+새 루트로 발급을 시작하기 전인 Phase 3 이후에 멈춥니다. 그래서 새 루트를
+자체 일정에 따라 채택하는 시스템에 먼저 전달할 수 있습니다. 이 옵션은
+`--full`과 함께일 때만 유효하며 `--skip`, `--force`, `--cleanup`과 함께
+쓸 수 없습니다. 그 밖의 조합은 인자 오류이며 아무것도 바꾸지 않습니다.
+
+- Phase 2는 새 세대를 스테이징 경로에 만듭니다. 각 파일은 실제 파일과
+  같은 디렉터리에 있습니다: `secrets/certs/root_ca.crt.staged`,
+  `secrets/secrets/root_ca_key.staged`,
+  `secrets/certs/intermediate_ca.crt.staged`,
+  `secrets/secrets/intermediate_ca_key.staged`. 새 중간 CA는 스테이징된 새
+  루트로 서명됩니다. step-ca의 `ca.json`이 가리키는 유일한 파일인 실제
+  파일은 이전 세대를 유지하므로, 회전이 일시 중지된 동안 step-ca가
+  재시작되더라도(재부팅, 컨테이너 재시작) 여전히 이전 루트로 발급합니다.
+- Phase 3는 다른 전체 회전과 같은 전이 trust를 게시합니다. 새 세대는
+  스테이징 경로에서, 이전 세대는 실제 경로에서 읽으므로 일시 중지된 동안
+  서비스는 두 세대를 모두 신뢰합니다. PostgreSQL 인증서는 재발급하지
+  않으며, Phase 4가 재발급합니다.
+- 그런 다음 실행이 멈추고 성공으로 종료합니다. 스테이징된 새 루트 인증서의
+  경로, 그 SHA-256 지문(DER 인코딩, 소문자 16진수), PEM 형식의 인증서,
+  그리고 회전을 이어서 진행하는 명령 `bootroot rotate ca-key --full`을
+  출력합니다.
+- 일시 중지된 동안 `rotate ca-key --full --pause-before-step-ca`를 다시
+  실행하면 아무것도 바꾸지 않고 같은 출력을 다시 표시합니다. 이 옵션을 주면
+  다음 경우에는 아무것도 바꾸기 전에 거부합니다: Phase 4가 이미 시작된
+  회전(옵션 없이 `bootroot rotate ca-key --full`로 계속하세요), Phase 4
+  이후의 회전(step-ca가 이미 전환됨), 이 옵션 없이 시작된 진행 중 회전.
+- 옵션 없이 `bootroot rotate ca-key --full`을 실행하면 회전을 이어서
+  진행합니다. 스테이징된 회전의 Phase 4는 다음과 같습니다:
+  1. Phase 4가 시작되었다는 사실을 step-ca 컨테이너의 재시작 정책과 함께
+     `rotation-state.json`에 기록합니다.
+  2. step-ca 컨테이너를 중지하고 제거합니다
+     (`docker compose rm -sf step-ca`). 중지만 한 컨테이너는
+     `restart: always` 때문에 호스트나 Docker 데몬이 재시작되면 다시
+     올라오지만, 제거된 컨테이너는 그럴 수 없습니다.
+  3. 스테이징된 각 파일을 이름 변경(rename)으로 실제 경로에 옮깁니다.
+     순서는 루트 인증서, 루트 키, 중간 키, 중간 인증서입니다. `.bak`
+     백업은 그대로 둡니다.
+  4. `state.json` → `infra_certs`에 `postgres` 항목이 있으면 새 중간 CA로
+     PostgreSQL 서버 인증서를 발급하고 `SIGHUP`으로 PostgreSQL을
+     재로드합니다. step-ca는 `sslmode=verify-full`과 단일 실제 루트로
+     PostgreSQL에 연결하므로, step-ca가 시작되기 전에 PostgreSQL이 새 세대
+     인증서를 제시해야 합니다. 이 단계는 `step`을 오프라인으로 실행하며
+     step-ca가 필요하지 않습니다.
+  5. 실제 루트와 중간 인증서가 `rotation-state.json`에 기록된 새
+     인증서인지, 각 실제 키가 자기 인증서의 키인지, PostgreSQL 인증서가 새
+     중간 CA로 발급되었는지 확인합니다. 그런 다음에만
+     `docker compose up -d --no-deps step-ca`로 step-ca를 다시 생성합니다.
+     이때 `bootroot infra up`이 step-ca에 넘기는 compose 파일(기본 compose
+     파일, 그리고 `state.json`에 `stepca_bind_addr`가 기록되어 있으면
+     step-ca exposed-port override)을 넘기고, `infra up
+     --restart-policy`처럼 `docker update --restart`로 기록된 재시작 정책을
+     되돌려 놓습니다. 확인에 실패하면 step-ca를 시작하지 않고 오류로
+     종료합니다.
+
+  나머지(엔드포인트 호스트에서 Phase 4 뒤에 오는 registrar-internal 단계와
+  Phase 5~7)는 다른 전체 회전과 같습니다. Phase 4의 각 단계는 반복해도
+  안전하므로, Phase 4 도중 어디에서 중단되었든 `bootroot rotate ca-key
+  --full`을 다시 실행하면 Phase 4와 회전을 마칩니다.
+- Phase 4가 step-ca 컨테이너를 제거한 뒤 다시 시작하기 전에 중단되면,
+  `bootroot rotate ca-key --full`을 다시 실행해 마칠 때까지 step-ca는 없는
+  상태로 남고 인증서가 발급되지 않습니다.
+- 그 사이에 bootroot 스택에서 `docker compose up`이나 `bootroot infra up`을
+  실행하면 step-ca가 다시 생성됩니다. step-ca는 스택의 기본 서비스이고,
+  `lan`과 `public` 프로필의 `prometheus`가 `depends_on: step-ca`를 갖기
+  때문입니다. 파일을 옮기는 순서가 그런 step-ca가 할 수 있는 일을
+  제한합니다. 마지막 이동 전에는 이전 중간 인증서와 이전 키를 보고 이전
+  세대로 발급하거나, 새 중간 키와 이전 중간 인증서를 보고 시작하지 못하거나
+  검증 가능한 인증서를 만들지 못합니다. 새 세대로 발급하는 것은 마지막
+  이동이 끝난 뒤에만 가능합니다. `bootroot rotate ca-key --full`을 다시
+  실행하면 그 컨테이너를 다시 제거하고 마칩니다.
+- 일시 중지된 회전을 `--pause-before-step-ca`가 추가된 릴리스보다 오래된
+  bootroot로 이어서 진행하는 것은 지원하지 않습니다.
+
+Clumit Endpoint 엔드포인트가 있을 때 루트 회전은 다음 순서로 진행합니다.
+
+1. `bootroot rotate ca-key --full --pause-before-step-ca`를 실행합니다.
+2. 출력된 새 루트 PEM을 aice-web-next의 루트 회전 화면에 붙여 넣고, 그곳의
+   지문이 bootroot가 출력한 지문과 일치하는지 확인합니다.
+3. aice-web-next가 두 루트를 모두 담은 주소 문서를 배포하게 하고, 그곳에서
+   채택 비율을 지켜봅니다.
+4. `bootroot rotate ca-key --full`을 실행해 이어서 진행합니다. 그때까지 새
+   루트를 채택하지 않은 엔드포인트는 다시 설치해야 합니다.
+5. 회전이 끝나면 aice-web-next에서 이전 루트를 제거합니다.
+
+운영 가이드의
+[Clumit Endpoint를 위한 전체 CA 회전 일시 중지](operations.md#pausing-a-full-ca-rotation-for-clumit-endpoint)에서
+이 절차를 설명합니다.
+
 입력:
 
 - `--full`: 루트 + 중간 CA 키 모두 교체(기본: 중간 CA만)
@@ -2554,6 +2649,10 @@ Phase 3과 Phase 6도 해당 자격증명의 전용 trust 번들과 핀을 각�
   인증서가 새 중간 CA를 발급자로 명시하지 않거나 그 중간 CA의 키로
   서명되지 않은 서비스입니다
 - `--cleanup`: 완료 시 백업 파일 삭제(Phase 7)
+- `--pause-before-step-ca`: 새 세대를 스테이징 경로에 만들고, step-ca가 새
+  루트로 전환되기 전인 Phase 3 이후에 멈춥니다. `--full`이 필요하며
+  `--skip`, `--force`, `--cleanup`과 함께 쓸 수 없습니다.
+  [step-ca 전환 전 일시 중지](#pausing-before-step-ca-switches) 참고
 - `--registrar-socket-unit <path>`: registrar 엔드포인트의
   `ListenStream=`을 읽을 소켓 유닛. `registrar capabilities
   --socket-unit`과 똑같이 동작하며, registrar 엔드포인트 호스트의 전체

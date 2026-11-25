@@ -9332,3 +9332,588 @@ async fn test_rotate_if_due_refuses_before_any_request() {
     );
     assert_no_request(&openbao).await;
 }
+
+// ---------------------------------------------------------------------
+// `rotate ca-key --full --pause-before-step-ca`
+// ---------------------------------------------------------------------
+
+/// The new CA generation a staged rotation's fake `step` installs, and a
+/// `PostgreSQL` leaf its intermediate signed, as files under the test
+/// root.
+struct StagedFixture {
+    root_cert: String,
+    root_key: String,
+    intermediate_cert: String,
+    intermediate_key: String,
+    envs: Vec<(&'static str, std::ffi::OsString)>,
+    docker_log: PathBuf,
+}
+
+/// A fake `docker` for a staged full rotation. It translates the
+/// container paths a `step` helper is handed back to the host through
+/// its `-v` mounts, so it writes exactly where production pointed it:
+/// `step certificate create` copies the fixture's new root, intermediate
+/// or `PostgreSQL` leaf there, and `step crypto key public` answers with
+/// the public half of the (unencrypted) key file through `openssl`.
+/// `inspect` reports the restart policy `always`; everything else
+/// succeeds silently. Every invocation is logged one per line.
+fn write_staged_rotation_fake_docker(bin_dir: &Path) {
+    let script = r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$DOCKER_OUTPUT"
+first_mount=""
+second_mount=""
+prev=""
+after_create=0
+cert_arg=""
+key_arg=""
+pub_key=""
+for arg in "$@"; do
+  if [ "$prev" = "-v" ]; then
+    if [ -z "$first_mount" ]; then first_mount="$arg"; else second_mount="$arg"; fi
+  fi
+  if [ "$prev" = "public" ]; then pub_key="$arg"; fi
+  case "$after_create" in
+    1) after_create=2 ;;
+    2) cert_arg="$arg"; after_create=3 ;;
+    3) key_arg="$arg"; after_create=4 ;;
+  esac
+  if [ "$prev" = "certificate" ] && [ "$arg" = "create" ]; then after_create=1; fi
+  prev="$arg"
+done
+to_host() {
+  case "$1" in
+    /home/step/*) printf '%s%s' "${first_mount%%:*}" "${1#/home/step}" ;;
+    *) printf '%s%s' "${second_mount%%:*}" "${1#"${second_mount#*:}"}" ;;
+  esac
+}
+case "$*" in
+  *"crypto key public"*)
+    openssl pkey -in "$(to_host "$pub_key")" -pubout
+    ;;
+  *"--profile root-ca"*)
+    cp "$NEW_ROOT_CERT" "$(to_host "$cert_arg")"
+    cp "$NEW_ROOT_KEY" "$(to_host "$key_arg")"
+    ;;
+  *"--profile intermediate-ca"*)
+    cp "$NEW_INTERMEDIATE_CERT" "$(to_host "$cert_arg")"
+    cp "$NEW_INTERMEDIATE_KEY" "$(to_host "$key_arg")"
+    ;;
+  *"certificate create"*"--bundle"*)
+    cp "$NEW_POSTGRES_CERT" "$(to_host "$cert_arg")"
+    printf 'key\n' > "$(to_host "$key_arg")"
+    ;;
+  *" inspect "*|"inspect "*)
+    echo always
+    ;;
+esac
+exit 0
+"#;
+    let docker_path = bin_dir.join("docker");
+    fs::write(&docker_path, script).expect("write fake docker");
+    fs::set_permissions(&docker_path, fs::Permissions::from_mode(0o700))
+        .expect("chmod fake docker");
+}
+
+/// A new CA generation as PEM, and a `PostgreSQL` leaf its
+/// intermediate signed.
+struct NewGeneration {
+    root_cert: String,
+    root_key_pem: String,
+    intermediate_cert: String,
+    intermediate_key_pem: String,
+    postgres_cert: String,
+}
+
+fn new_generation() -> NewGeneration {
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+
+    let ca_params = |name: &str| {
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
+        params.distinguished_name.push(DnType::CommonName, name);
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params
+    };
+    let root_key = KeyPair::generate().expect("root key");
+    let root_params = ca_params("Bootroot Root CA");
+    let root_cert = root_params
+        .clone()
+        .self_signed(&root_key)
+        .expect("root")
+        .pem();
+    let root_key_pem = root_key.serialize_pem();
+    let root_issuer = Issuer::new(root_params, root_key);
+    let intermediate_key = KeyPair::generate().expect("intermediate key");
+    let intermediate_params = ca_params("Bootroot Intermediate CA");
+    let intermediate_cert = intermediate_params
+        .clone()
+        .signed_by(&intermediate_key, &root_issuer)
+        .expect("intermediate")
+        .pem();
+    let intermediate_key_pem = intermediate_key.serialize_pem();
+    let intermediate_issuer = Issuer::new(intermediate_params, intermediate_key);
+    let leaf_key = KeyPair::generate().expect("leaf key");
+    let mut leaf_params = CertificateParams::new(vec!["postgres".to_string()]).expect("leaf");
+    leaf_params
+        .distinguished_name
+        .push(DnType::CommonName, "postgres");
+    let postgres_cert = leaf_params
+        .signed_by(&leaf_key, &intermediate_issuer)
+        .expect("leaf")
+        .pem();
+
+    NewGeneration {
+        root_cert,
+        root_key_pem,
+        intermediate_cert,
+        intermediate_key_pem,
+        postgres_cert,
+    }
+}
+
+/// Stages a full rotation whose `state.json` records a `PostgreSQL`
+/// certificate, with the fake `docker` above and a new generation for
+/// it to install.
+fn stage_staged_rotation(root: &Path, openbao_url: &str) -> StagedFixture {
+    support::create_secrets_dir(root).expect("create secrets dir");
+    support::write_password_file(&root.join("secrets"), "test-password").expect("password");
+    write_state_file(root, openbao_url).expect("write state");
+    let state_path = root.join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&state_path).expect("read state"))
+            .expect("parse state");
+    let postgres_tls = root.join("postgres").join("tls");
+    fs::create_dir_all(&postgres_tls).expect("postgres tls dir");
+    fs::write(
+        postgres_tls.join("server.crt"),
+        generate_test_cert_pem("old-postgres"),
+    )
+    .expect("old postgres cert");
+    fs::write(postgres_tls.join("server.key"), "old key\n").expect("old postgres key");
+    state["infra_certs"] = json!({
+        "postgres": {
+            "cert_path": postgres_tls.join("server.crt"),
+            "key_path": postgres_tls.join("server.key"),
+            "sans": ["postgres"],
+            "renew_before": "720h",
+            "reload_strategy": {
+                "type": "container_signal",
+                "container_name": "bootroot-postgres",
+                "signal": "SIGHUP"
+            }
+        }
+    });
+    fs::write(
+        &state_path,
+        serde_json::to_string_pretty(&state).expect("serialize state"),
+    )
+    .expect("write state");
+    fs::write(
+        root.join("docker-compose.yml"),
+        "services:\n  step-ca:\n    image: test\n",
+    )
+    .expect("compose file");
+
+    let NewGeneration {
+        root_cert,
+        root_key_pem,
+        intermediate_cert,
+        intermediate_key_pem,
+        postgres_cert,
+    } = new_generation();
+
+    let fixtures = root.join("fixtures");
+    fs::create_dir_all(&fixtures).expect("fixtures dir");
+    let fixture = |name: &str, contents: &str| -> std::ffi::OsString {
+        let path = fixtures.join(name);
+        fs::write(&path, contents).expect("write fixture");
+        path.into()
+    };
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(&bin_dir).expect("bin dir");
+    write_staged_rotation_fake_docker(&bin_dir);
+    let pkill_log = root.join("pkill.log");
+    write_fake_pkill(&bin_dir, &pkill_log).expect("fake pkill");
+    let docker_log = root.join("docker.log");
+    fs::write(&docker_log, "").expect("seed docker log");
+    let path_var = env::var("PATH").unwrap_or_default();
+    let envs = vec![
+        ("PATH", format!("{}:{path_var}", bin_dir.display()).into()),
+        ("DOCKER_OUTPUT", docker_log.clone().into()),
+        ("PKILL_OUTPUT", pkill_log.into()),
+        ("NEW_ROOT_CERT", fixture("root.crt", &root_cert)),
+        ("NEW_ROOT_KEY", fixture("root.key", &root_key_pem)),
+        (
+            "NEW_INTERMEDIATE_CERT",
+            fixture("inter.crt", &intermediate_cert),
+        ),
+        (
+            "NEW_INTERMEDIATE_KEY",
+            fixture("inter.key", &intermediate_key_pem),
+        ),
+        ("NEW_POSTGRES_CERT", fixture("postgres.crt", &postgres_cert)),
+    ];
+    StagedFixture {
+        root_cert,
+        root_key: root_key_pem,
+        intermediate_cert,
+        intermediate_key: intermediate_key_pem,
+        envs,
+        docker_log,
+    }
+}
+
+/// The four live CA files step-ca reads or signs with, as bytes.
+fn live_ca_files(root: &Path) -> [Vec<u8>; 4] {
+    let secrets = root.join("secrets");
+    [
+        secrets.join("certs").join("root_ca.crt"),
+        secrets.join("secrets").join("root_ca_key"),
+        secrets.join("certs").join("intermediate_ca.crt"),
+        secrets.join("secrets").join("intermediate_ca_key"),
+    ]
+    .map(|path| fs::read(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display())))
+}
+
+fn staged_ca_paths(root: &Path) -> [PathBuf; 4] {
+    let secrets = root.join("secrets");
+    [
+        secrets.join("certs").join("root_ca.crt.staged"),
+        secrets.join("secrets").join("root_ca_key.staged"),
+        secrets.join("certs").join("intermediate_ca.crt.staged"),
+        secrets.join("secrets").join("intermediate_ca_key.staged"),
+    ]
+}
+
+fn der_sha256_hex(pem: &str) -> String {
+    use std::fmt::Write as _;
+
+    let der = rustls_pemfile::certs(&mut pem.as_bytes())
+        .next()
+        .expect("one certificate")
+        .expect("pem");
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, der.as_ref());
+    digest.as_ref().iter().fold(String::new(), |mut hex, byte| {
+        let _ = write!(hex, "{byte:02x}");
+        hex
+    })
+}
+
+/// The pause block of a run's stdout: from its first line to the end.
+fn pause_block(stdout: &str) -> &str {
+    let start = stdout
+        .find("Rotation paused after Phase 3")
+        .unwrap_or_else(|| panic!("no pause output in:\n{stdout}"));
+    stdout.get(start..).expect("pause block")
+}
+
+fn log_lines(docker_log: &Path) -> Vec<String> {
+    fs::read_to_string(docker_log)
+        .expect("read docker log")
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+fn position_in(lines: &[String], needle: &str) -> usize {
+    lines
+        .iter()
+        .position(|line| line.contains(needle))
+        .unwrap_or_else(|| panic!("no `{needle}` in docker log:\n{}", lines.join("\n")))
+}
+
+fn assert_success(output: &std::process::Output, what: &str) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "{what} should succeed; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    stdout
+}
+
+/// The whole path: a run with the flag stops after Phase 3 with the new
+/// generation staged and the old one live, a second run with the flag
+/// changes nothing and prints the same pause output, and a run without
+/// it moves the staged files into place in Phase 4 and completes —
+/// `PostgreSQL` reissued only then, after step-ca is removed and before
+/// it is started again.
+// One scenario across three runs, asserted between them; splitting it
+// would only pass the fixture from one function to the next.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn test_rotate_ca_key_pause_before_step_ca_pauses_then_continues() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let root = temp_dir.path();
+    let openbao = MockServer::start().await;
+    stub_openbao_for_ca_key_rotation(&openbao).await;
+    let fixture = stage_staged_rotation(root, &openbao.uri());
+    let old_live = live_ca_files(root);
+
+    let first = run_rotate_ca_key(
+        root,
+        &openbao.uri(),
+        &fixture.envs,
+        &["--full", "--pause-before-step-ca"],
+    );
+    let first_stdout = assert_success(&first, "the pausing run");
+
+    let state = rotation_state_json(root);
+    assert_eq!(state["phase"], 3, "{state}");
+    assert_eq!(state["staged"], true, "{state}");
+    assert_eq!(state["phase4_started"], false, "{state}");
+    assert_eq!(state["new_root_fp"], der_sha256_hex(&fixture.root_cert));
+    assert_eq!(
+        state["new_intermediate_fp"],
+        der_sha256_hex(&fixture.intermediate_cert)
+    );
+    assert_eq!(live_ca_files(root), old_live, "the live files stay old");
+    let [root_staged, root_key_staged, inter_staged, inter_key_staged] = staged_ca_paths(root);
+    assert_eq!(read_text(&root_staged), fixture.root_cert);
+    assert_eq!(read_text(&root_key_staged), fixture.root_key);
+    assert_eq!(read_text(&inter_staged), fixture.intermediate_cert);
+    assert_eq!(read_text(&inter_key_staged), fixture.intermediate_key);
+
+    let block = pause_block(&first_stdout).to_string();
+    let absolute_staged = fs::canonicalize(root)
+        .expect("canonical root")
+        .join("secrets/certs/root_ca.crt.staged");
+    assert!(
+        block.contains(&format!(
+            "Staged new root certificate: {}\n",
+            absolute_staged.display()
+        )),
+        "{block}"
+    );
+    assert!(
+        block.contains(&der_sha256_hex(&fixture.root_cert)),
+        "{block}"
+    );
+    assert!(block.contains("bootroot rotate ca-key --full"), "{block}");
+    assert!(block.contains(fixture.root_cert.trim()), "{block}");
+    let paused_log = log_lines(&fixture.docker_log);
+    assert!(
+        !paused_log.iter().any(|line| line.contains("--bundle")
+            || line.contains("compose")
+            || line.contains("crypto key public")),
+        "pausing must neither reissue PostgreSQL nor touch step-ca:\n{}",
+        paused_log.join("\n")
+    );
+
+    // Paused: the same run again changes nothing.
+    let state_bytes = fs::read(root.join("rotation-state.json")).expect("state bytes");
+    let second = run_rotate_ca_key(
+        root,
+        &openbao.uri(),
+        &fixture.envs,
+        &["--full", "--pause-before-step-ca"],
+    );
+    let second_stdout = assert_success(&second, "the repeated pause");
+    assert_eq!(pause_block(&second_stdout), block);
+    assert_eq!(
+        fs::read(root.join("rotation-state.json")).expect("state bytes"),
+        state_bytes
+    );
+    assert_eq!(log_lines(&fixture.docker_log), paused_log);
+    assert_eq!(live_ca_files(root), old_live);
+
+    // Continue without the flag.
+    let third = run_rotate_ca_key(root, &openbao.uri(), &fixture.envs, &["--full"]);
+    assert_success(&third, "the continuing run");
+    assert!(!root.join("rotation-state.json").exists());
+    assert_eq!(
+        live_ca_files(root),
+        [
+            fixture.root_cert.clone().into_bytes(),
+            fixture.root_key.clone().into_bytes(),
+            fixture.intermediate_cert.clone().into_bytes(),
+            fixture.intermediate_key.clone().into_bytes(),
+        ]
+    );
+    for staged in staged_ca_paths(root) {
+        assert!(!staged.exists(), "{} was moved", staged.display());
+    }
+    assert_eq!(
+        fs::read(root.join("secrets").join("certs").join("root_ca.crt.bak")).expect("backup"),
+        old_live[0],
+        "the backups keep the old generation"
+    );
+
+    let log = log_lines(&fixture.docker_log);
+    let tail: Vec<String> = log.get(paused_log.len()..).expect("new lines").to_vec();
+    let rm = position_in(&tail, "rm -sf step-ca");
+    let reissue = position_in(&tail, "--bundle");
+    let key_check = position_in(&tail, "crypto key public");
+    let up = position_in(&tail, "up -d --no-deps step-ca");
+    let update = position_in(&tail, "update --restart always");
+    assert!(
+        rm < reissue && reissue < key_check && key_check < up && up < update,
+        "{}",
+        tail.join("\n")
+    );
+    assert!(
+        !tail
+            .iter()
+            .any(|line| line.contains("compose") && line.contains("restart step-ca")),
+        "a staged Phase 4 recreates step-ca rather than restarting it"
+    );
+}
+
+fn read_text(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_else(|err| panic!("{}: {err}", path.display()))
+}
+
+/// Interrupted in Phase 4 — after step-ca's removal, and again after the
+/// root files have moved — a run with the flag changes nothing and says
+/// to continue without it; a run without it completes.
+#[tokio::test]
+async fn test_rotate_ca_key_pause_before_step_ca_after_phase4_started_says_continue() {
+    for roots_moved in [false, true] {
+        let temp_dir = tempdir().expect("create temp dir");
+        let root = temp_dir.path();
+        let openbao = MockServer::start().await;
+        stub_openbao_for_ca_key_rotation(&openbao).await;
+        let fixture = stage_staged_rotation(root, &openbao.uri());
+        let first = run_rotate_ca_key(
+            root,
+            &openbao.uri(),
+            &fixture.envs,
+            &["--full", "--pause-before-step-ca"],
+        );
+        assert_success(&first, "the pausing run");
+
+        let mut state = rotation_state_json(root);
+        state["phase4_started"] = json!(true);
+        state["stepca_restart_policy"] = json!("always");
+        fs::write(
+            root.join("rotation-state.json"),
+            serde_json::to_string_pretty(&state).expect("serialize"),
+        )
+        .expect("write state");
+        if roots_moved {
+            let [root_staged, root_key_staged, _, _] = staged_ca_paths(root);
+            fs::rename(&root_staged, root.join("secrets/certs/root_ca.crt")).expect("move");
+            fs::rename(&root_key_staged, root.join("secrets/secrets/root_ca_key")).expect("move");
+        }
+        let state_bytes = fs::read(root.join("rotation-state.json")).expect("state");
+        let live_before = live_ca_files(root);
+        let log_before = log_lines(&fixture.docker_log);
+
+        let refused = run_rotate_ca_key(
+            root,
+            &openbao.uri(),
+            &fixture.envs,
+            &["--full", "--pause-before-step-ca"],
+        );
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(!refused.status.success(), "roots moved {roots_moved}");
+        assert!(
+            stderr.contains("Phase 4 of the paused rotation has already started")
+                && stderr.contains("without --pause-before-step-ca"),
+            "{stderr}"
+        );
+        assert_eq!(
+            fs::read(root.join("rotation-state.json")).expect("state"),
+            state_bytes
+        );
+        assert_eq!(live_ca_files(root), live_before);
+        assert_eq!(log_lines(&fixture.docker_log), log_before);
+
+        let continued = run_rotate_ca_key(root, &openbao.uri(), &fixture.envs, &["--full"]);
+        assert_success(&continued, "the continuing run");
+        assert!(!root.join("rotation-state.json").exists());
+        assert_eq!(
+            read_text(&root.join("secrets/certs/root_ca.crt")),
+            fixture.root_cert
+        );
+        assert_eq!(
+            read_text(&root.join("secrets/certs/intermediate_ca.crt")),
+            fixture.intermediate_cert
+        );
+    }
+}
+
+/// The flag on a rotation that can no longer pause before step-ca is an
+/// error that changes nothing: one at Phase 4 or later, and one in
+/// progress that was started without staging.
+#[tokio::test]
+async fn test_rotate_ca_key_pause_before_step_ca_refuses_unpausable_rotations() {
+    for (phase, staged, expected) in [
+        (4, true, "step-ca has already been switched"),
+        (5, false, "step-ca has already been switched"),
+        (2, false, "was started without staging"),
+        (3, false, "was started without staging"),
+    ] {
+        let temp_dir = tempdir().expect("create temp dir");
+        let root = temp_dir.path();
+        let openbao = MockServer::start().await;
+        stub_openbao_for_ca_key_rotation(&openbao).await;
+        let fixture = stage_staged_rotation(root, &openbao.uri());
+        let mut state = json!({
+            "mode": "full",
+            "started_at": "2026-11-26T00:00:00Z",
+            "old_root_fp": "aaa",
+            "new_root_fp": "bbb",
+            "old_intermediate_fp": "ccc",
+            "new_intermediate_fp": "ddd",
+            "phase": phase
+        });
+        if staged {
+            state["staged"] = json!(true);
+            state["phase4_started"] = json!(true);
+        }
+        let state_text = serde_json::to_string_pretty(&state).expect("serialize");
+        fs::write(root.join("rotation-state.json"), &state_text).expect("write state");
+        let live_before = live_ca_files(root);
+
+        let output = run_rotate_ca_key(
+            root,
+            &openbao.uri(),
+            &fixture.envs,
+            &["--full", "--pause-before-step-ca"],
+        );
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "phase {phase}: {stderr}");
+        assert!(stderr.contains(expected), "phase {phase}: {stderr}");
+        assert_eq!(read_text(&root.join("rotation-state.json")), state_text);
+        assert_eq!(live_ca_files(root), live_before);
+        assert!(
+            log_lines(&fixture.docker_log).is_empty(),
+            "phase {phase}: nothing may reach docker"
+        );
+    }
+}
+
+/// The flag is an argument error without `--full`, and alongside
+/// `--skip`, `--force` or `--cleanup`.
+#[test]
+fn test_rotate_ca_key_pause_before_step_ca_argument_errors() {
+    let temp_dir = tempdir().expect("create temp dir");
+    for (extra, named) in [
+        (vec!["--pause-before-step-ca"], "--full"),
+        (
+            vec!["--full", "--pause-before-step-ca", "--skip", "reissue"],
+            "--skip",
+        ),
+        (
+            vec!["--full", "--pause-before-step-ca", "--force"],
+            "--force",
+        ),
+        (
+            vec!["--full", "--pause-before-step-ca", "--cleanup"],
+            "--cleanup",
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+            .current_dir(temp_dir.path())
+            .args(["rotate", "ca-key"])
+            .args(&extra)
+            .output()
+            .expect("run rotate ca-key");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{extra:?}: {stderr}");
+        assert!(stderr.contains(named), "{extra:?}: {stderr}");
+    }
+    assert!(!temp_dir.path().join("rotation-state.json").exists());
+}

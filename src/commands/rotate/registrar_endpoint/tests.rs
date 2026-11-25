@@ -219,6 +219,9 @@ fn state(phase: u8, old: &Generation, new: &Generation) -> RotationState {
         old_intermediate_fp: old.intermediate_fp(),
         new_intermediate_fp: new.intermediate_fp(),
         phase,
+        staged: false,
+        phase4_started: false,
+        stepca_restart_policy: None,
     }
 }
 

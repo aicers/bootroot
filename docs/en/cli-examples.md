@@ -566,6 +566,30 @@ bootroot rotate \
   ca-key --full --cleanup
 ```
 
+CA key rotation (full), paused before step-ca switches to the new root — the
+first command stops after Phase 3 and prints the staged new root, the second
+continues once the new root has been distributed:
+
+```bash
+bootroot rotate \
+  --compose-file docker-compose.yml \
+  --openbao-url http://localhost:8200 \
+  --auth-mode approle \
+  --approle-role-id "$ROTATE_ROLE_ID" \
+  --approle-secret-id "$ROTATE_SECRET_ID" \
+  --yes \
+  ca-key --full --pause-before-step-ca
+
+bootroot rotate \
+  --compose-file docker-compose.yml \
+  --openbao-url http://localhost:8200 \
+  --auth-mode approle \
+  --approle-role-id "$ROTATE_ROLE_ID" \
+  --approle-secret-id "$ROTATE_SECRET_ID" \
+  --yes \
+  ca-key --full
+```
+
 After CA key rotation, force-reissue certificates for all services:
 
 ```bash

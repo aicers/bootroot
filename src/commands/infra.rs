@@ -175,6 +175,28 @@ fn up_compose_files<'a>(overrides: &UpComposeOverrides<'a>) -> Vec<&'a str> {
     files
 }
 
+/// The compose files `infra up` would pass for a recreate of step-ca
+/// alone: the base compose file and, when one is given, the step-ca
+/// exposed-port override, in the place [`up_compose_files`] gives it.
+///
+/// A full rotation recreating step-ca uses this, so a `--stepca-bind`
+/// publication survives the recreate rather than falling back to the
+/// base file's loopback one.
+pub(crate) fn stepca_up_compose_files<'a>(
+    compose_file: &'a str,
+    stepca_override: Option<&'a str>,
+) -> Vec<&'a str> {
+    up_compose_files(&UpComposeOverrides {
+        compose_file,
+        openbao: None,
+        audit: None,
+        responder_config: None,
+        http01: None,
+        stepca: stepca_override,
+        postgres_tls: None,
+    })
+}
+
 /// Returns the project a compose file defines, as `docker compose config
 /// --format json` prints it; see [`read_compose_config`].
 pub(crate) type ReadComposeConfig<'a> = dyn Fn(&Path) -> Result<String> + 'a;
