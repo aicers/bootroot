@@ -666,7 +666,7 @@ check_harness_wiring() {
       || die "${script} does not end its cleanup with the run's own status"
     # Its teardown is `teardown_instance` rather than a `compose_down`,
     # so the `/dev/null` sweep below does not reach it.
-    ! grep -q 'docker \(rm -f\|volume rm -f\|network rm\) "\$id" >/dev/null' \
+    ! grep -q 'docker \(rm -fv\?\|volume rm -f\|network rm\) "\$id" >/dev/null' \
       "$IMPL_DIR/$script" \
       || die "${script}'s teardown still discards its output"
   done
