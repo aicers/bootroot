@@ -570,7 +570,10 @@ fn while_paused_the_files_stepca_reads_are_the_old_generation() {
         rig.ctx.paths.intermediate_key_staged(),
     ] {
         let container = to_container_path(secrets, &staged, STEP_HELPER_MOUNT).expect("path");
-        assert!(!ca_json.contains(&container), "{container} in {ca_json}");
+        assert!(
+            !ca_json.contains(&container),
+            "ca.json reads a staging path"
+        );
     }
     for (live, target) in [
         (rig.ctx.paths.root_cert(), LIVE_CA_TARGETS.root_cert),
@@ -602,7 +605,7 @@ async fn phase3_bundle_carries_both_generations() {
     .await
     .expect("bundle");
 
-    assert_eq!(bundle.matches("BEGIN CERTIFICATE").count(), 4, "{bundle}");
+    assert_eq!(bundle.matches("BEGIN CERTIFICATE").count(), 4);
     for generation in [&rig.old, &rig.new] {
         assert!(bundle.contains(generation.root_cert.trim()));
         assert!(bundle.contains(generation.intermediate_cert.trim()));
@@ -633,7 +636,7 @@ async fn repair_bundle_carries_both_generations_while_paused_and_after_each_move
         assert_eq!(
             bundle.matches("BEGIN CERTIFICATE").count(),
             4,
-            "after {moved} moves: {bundle}"
+            "after {moved} moves"
         );
         for generation in [&rig.old, &rig.new] {
             assert!(
@@ -730,7 +733,10 @@ fn staged_generation_args_write_and_sign_at_the_staging_paths() {
         LIVE_CA_TARGETS.intermediate_cert,
         LIVE_CA_TARGETS.intermediate_key,
     ] {
-        assert!(!intermediate.iter().any(|arg| arg == live), "{live}");
+        assert!(
+            !intermediate.iter().any(|arg| arg == live),
+            "the staged intermediate reads a live path"
+        );
     }
 }
 

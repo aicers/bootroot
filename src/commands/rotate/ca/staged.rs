@@ -451,6 +451,15 @@ fn public_key_der_from_pem(output: &[u8]) -> Result<Vec<u8>> {
     Ok(pem.contents)
 }
 
+/// What one staged move did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StagedMoveOutcome {
+    /// The staged file was renamed onto its live path.
+    Moved,
+    /// The staged file was already gone and the live file checked out.
+    AlreadyMoved,
+}
+
 /// One file Phase 4 moves into place: from its staging path to its live
 /// path, in the same directory. A certificate carries the fingerprint the
 /// rotation state records for it, which the file has to have on either
@@ -543,11 +552,23 @@ pub(super) async fn switch_to_staged_generation(
 
     for staged_move in staged_moves(&ctx.paths, state) {
         let messages_for_task = messages.clone();
-        let moved = ctx
+        let staged_display = staged_move.staged.display().to_string();
+        let live_display = staged_move.live.display().to_string();
+        let outcome = ctx
             .secrets
             .run(move |tree| move_staged_file(tree, &staged_move, &messages_for_task))
             .await?;
-        println!("{moved}");
+        // Built from the move's paths alone, never from what the secrets
+        // tree returned, so nothing read from it reaches stdout.
+        let line = match outcome {
+            StagedMoveOutcome::Moved => {
+                messages.rotate_ca_key_staged_moved(&staged_display, &live_display)
+            }
+            StagedMoveOutcome::AlreadyMoved => {
+                messages.rotate_ca_key_staged_already_moved(&staged_display)
+            }
+        };
+        println!("{line}");
     }
 
     if let Some(cert) = postgres_cert_path(ctx)
@@ -570,7 +591,7 @@ pub(super) async fn switch_to_staged_generation(
 
 /// Moves one staged file into place by a rename within its directory and
 /// flushes the directory, so a resume finds the move it reported. Returns
-/// the line to print. Blocking.
+/// whether it moved the file or found it moved already. Blocking.
 ///
 /// A staged file that is absent counts as moved already; a certificate
 /// must then be at its live path with the recorded fingerprint. A staged
@@ -584,7 +605,7 @@ pub(super) fn move_staged_file(
     tree: &SecretsTree,
     staged_move: &StagedMove,
     messages: &Messages,
-) -> Result<String> {
+) -> Result<StagedMoveOutcome> {
     let staged_display = staged_move.staged.display().to_string();
     let live_display = staged_move.live.display().to_string();
     if !present_in(tree, &staged_move.staged)
@@ -593,7 +614,7 @@ pub(super) fn move_staged_file(
         if let Some(expected) = &staged_move.expected_fp {
             check_fingerprint_in(tree, &staged_move.live, expected, messages)?;
         }
-        return Ok(messages.rotate_ca_key_staged_already_moved(&staged_display));
+        return Ok(StagedMoveOutcome::AlreadyMoved);
     }
     if let Some(expected) = &staged_move.expected_fp {
         check_fingerprint_in(tree, &staged_move.staged, expected, messages)?;
@@ -604,7 +625,7 @@ pub(super) fn move_staged_file(
         sync_dir_in(tree, dir)
             .with_context(|| messages.error_write_file_failed(&dir.display().to_string()))?;
     }
-    Ok(messages.rotate_ca_key_staged_moved(&staged_display, &live_display))
+    Ok(StagedMoveOutcome::Moved)
 }
 
 /// Fails unless the certificate at `path` has the fingerprint `expected`.

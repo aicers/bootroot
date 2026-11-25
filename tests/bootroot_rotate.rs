@@ -9760,7 +9760,7 @@ async fn test_rotate_ca_key_pause_before_step_ca_pauses_then_continues() {
 }
 
 fn read_text(path: &Path) -> String {
-    fs::read_to_string(path).unwrap_or_else(|err| panic!("{}: {err}", path.display()))
+    fs::read_to_string(path).expect("the fixture file is readable")
 }
 
 /// Interrupted in Phase 4 — after step-ca's removal, and again after the
