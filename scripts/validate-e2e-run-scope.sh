@@ -430,7 +430,7 @@ check_markers() {
     || die "write_run_marker left its temporary file behind"
   ok "a marker records this run's pid and project, published under the instance name"
 
-  # The directory holds the names the sweep hands to `docker rm -f`, so a
+  # The directory holds the names the sweep hands to `docker rm -fv`, so a
   # world-writable one at a predictable `/tmp` path would let anyone who
   # can write there choose them.  A pre-existing directory is re-moded
   # rather than trusted, and the sweep applies the same rule because it
@@ -945,7 +945,7 @@ case "${1:-}:${2:-}" in
     cat "$CONTAINERS"
     exit 0
     ;;
-  rm:-f)
+  rm:-fv)
     printf 'rm %s\n' "$3" >>"${QUERY_LOG:-/dev/null}"
     refuse_if_failing rm
     grep -qxF "$3" "$CONTAINERS" || { echo "Error: No such container: $3" >&2; exit 1; }

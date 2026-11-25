@@ -125,7 +125,7 @@ teardown_instance() {
     timeout --kill-after=10 90 env BOOTROOT_INSTANCE="$INSTANCE" POSTGRES_PASSWORD=cleanup-only GRAFANA_ADMIN_PASSWORD=cleanup-only docker compose -p "$INSTANCE" -f "$WORK_DIR/docker-compose.deploy.yml" down --volumes --remove-orphans >>"$RUN_LOG" 2>&1 || status=1
   fi
   if ids="$(docker ps -aq --filter "label=com.docker.compose.project=${INSTANCE}" 2>>"$RUN_LOG")"; then
-    for id in $ids; do docker rm -f "$id" >>"$RUN_LOG" 2>&1 || status=1; done
+    for id in $ids; do docker rm -fv "$id" >>"$RUN_LOG" 2>&1 || status=1; done
   else
     status=1
   fi

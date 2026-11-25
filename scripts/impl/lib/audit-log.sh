@@ -644,7 +644,7 @@ openbao_audit_run_against_standin() {
     fail "could not read the Compose project of ${reference}"
   [ -z "$project" ] || labels=(--label "com.docker.compose.project=${project}")
   standin="${reference}-${suffix}"
-  docker rm -f "$standin" >/dev/null 2>&1 || true
+  docker rm -fv "$standin" >/dev/null 2>&1 || true
   # `${labels[@]+…}`, not a bare `${labels[@]}`: under `set -u` an empty
   # array is an unbound variable before bash 4.4, and this file is
   # sourced by harnesses that set it.
@@ -657,7 +657,7 @@ openbao_audit_run_against_standin() {
   OPENBAO_AUDIT_STANDIN_OUTPUT="$(
     openbao_audit_reopen_probe "$standin" "$url" "role" "secret" "" "$ca" 2>&1
   )" || OPENBAO_AUDIT_STANDIN_STATUS=$?
-  docker rm -f "$standin" >/dev/null 2>&1 || true
+  docker rm -fv "$standin" >/dev/null 2>&1 || true
 }
 
 # Asserts the probe itself is capable of refusing.
