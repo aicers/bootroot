@@ -490,6 +490,7 @@ pub(crate) struct Strings {
     pub(crate) error_staged_chain_old_root: &'static str,
     pub(crate) error_step_public_key_unreadable: &'static str,
     pub(crate) error_staged_key_mismatch: &'static str,
+    pub(crate) error_staged_key_meta_failed: &'static str,
     pub(crate) error_postgres_cert_not_new_generation: &'static str,
     pub(crate) error_stepca_switch_verification_failed: &'static str,
     pub(crate) error_stepca_restart_policy_unreadable: &'static str,

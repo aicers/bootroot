@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::fmt::Write as _;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use bootroot::openbao::OpenBaoClient;
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, PublicKeyData};
@@ -854,6 +855,301 @@ async fn resumed_phase2_regenerates_an_incomplete_staged_root() {
         .expect("phase 2");
 
     assert_eq!(decode_fake_docker_log(&rig.docker_log).len(), 2);
+}
+
+// ---------------------------------------------------------------------
+// Phase 2: the staged keys' mode and owner
+// ---------------------------------------------------------------------
+
+/// The mode an operator may give the live CA keys instead of the
+/// default `0600`.
+const OPERATOR_KEY_MODE: u32 = 0o640;
+
+/// The permission bits, uid and gid of `path`.
+fn mode_and_owner(path: &Path) -> (u32, u32, u32) {
+    let meta = fs::metadata(path).expect("stat");
+    (meta.mode() & 0o7777, meta.uid(), meta.gid())
+}
+
+fn set_mode(path: &Path, mode: u32) {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("chmod");
+}
+
+/// The test's own uid and gid, as the files it creates get them.
+fn own_owner(rig: &Rig) -> (u32, u32) {
+    let meta = fs::metadata(rig.dir.path()).expect("stat tempdir");
+    (meta.uid(), meta.gid())
+}
+
+/// Gives the rig's live keys `mode`, owned by the test's own uid and
+/// gid, and its staged keys `step`'s default `0600`.
+fn set_key_modes(rig: &Rig, mode: u32) -> (u32, u32) {
+    let (uid, gid) = own_owner(rig);
+    let paths = &rig.ctx.paths;
+    for live in [paths.stepca_root_key(), paths.stepca_intermediate_key()] {
+        std::os::unix::fs::chown(&live, Some(uid), Some(gid)).expect("chown live key");
+        set_mode(&live, mode);
+    }
+    for staged in [paths.root_key_staged(), paths.intermediate_key_staged()] {
+        set_mode(&staged, 0o600);
+    }
+    (uid, gid)
+}
+
+/// Uses a handle forced into rooted mode, so the descriptor-relative
+/// branch runs as it does for root over a tree another account owns.
+fn use_rooted_tree(rig: &mut Rig) {
+    rig.ctx.secrets = std::sync::Arc::new(
+        SecretsTree::open_rooted_for_tests(rig.ctx.paths.secrets_dir()).expect("rooted tree"),
+    );
+}
+
+/// With the live keys at `0640` and a given owner, Phase 2 gives the
+/// staged keys exactly that mode and owner, through either handle, and
+/// the switch puts them in place with it.
+#[tokio::test]
+async fn phase2_gives_the_staged_keys_the_live_keys_mode_and_owner() {
+    for rooted in [false, true] {
+        let mut rig = Rig::paused();
+        if rooted {
+            use_rooted_tree(&mut rig);
+        }
+        let messages = test_messages();
+        let (uid, gid) = set_key_modes(&rig, OPERATOR_KEY_MODE);
+        let mut state = rig.state(1);
+
+        // The fake `docker` writes nothing, so the keys at the staging
+        // paths stand in for the ones `step` would have written.
+        generate_staged_generation(&rig.ctx, &mut state, false, &messages)
+            .await
+            .expect("phase 2");
+
+        let paths = &rig.ctx.paths;
+        for staged in [paths.root_key_staged(), paths.intermediate_key_staged()] {
+            assert_eq!(
+                mode_and_owner(&staged),
+                (OPERATOR_KEY_MODE, uid, gid),
+                "{} (rooted: {rooted})",
+                staged.display()
+            );
+        }
+        rig.apply_moves(4);
+        for live in [paths.stepca_root_key(), paths.stepca_intermediate_key()] {
+            assert_eq!(
+                mode_and_owner(&live),
+                (OPERATOR_KEY_MODE, uid, gid),
+                "{} after the switch (rooted: {rooted})",
+                live.display()
+            );
+        }
+        assert_live_is(&rig, &rig.new);
+    }
+}
+
+/// A supplementary group of this process other than the gid the rig's
+/// files get, confirmed by giving a probe file that group; `None` when
+/// there is none.
+fn other_group(rig: &Rig) -> Option<u32> {
+    let probe = rig.dir.path().join("group-probe");
+    fs::write(&probe, "").expect("write probe");
+    let own = mode_and_owner(&probe).2;
+    let output = ProcessCommand::new("id")
+        .arg("-G")
+        .output()
+        .expect("run id -G");
+    let found = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .filter_map(|gid| gid.parse::<u32>().ok())
+        .filter(|gid| *gid != own)
+        .find(|gid| std::os::unix::fs::chown(&probe, None, Some(*gid)).is_ok());
+    fs::remove_file(&probe).expect("remove probe");
+    found
+}
+
+/// With the live keys in another of the user's groups, Phase 2 changes
+/// the staged keys' group to it, through either handle: the owner change
+/// itself, not only a mode change.
+#[tokio::test]
+async fn phase2_gives_the_staged_keys_the_live_keys_group() {
+    for rooted in [false, true] {
+        let mut rig = Rig::paused();
+        let Some(group) = other_group(&rig) else {
+            // No second group to change to: the owner change cannot be shown.
+            return;
+        };
+        if rooted {
+            use_rooted_tree(&mut rig);
+        }
+        let messages = test_messages();
+        let (uid, gid) = set_key_modes(&rig, OPERATOR_KEY_MODE);
+        let paths = &rig.ctx.paths;
+        for live in [paths.stepca_root_key(), paths.stepca_intermediate_key()] {
+            std::os::unix::fs::chown(&live, None, Some(group)).expect("chgrp live key");
+        }
+        let mut state = rig.state(1);
+
+        generate_staged_generation(&rig.ctx, &mut state, false, &messages)
+            .await
+            .expect("phase 2");
+
+        for staged in [paths.root_key_staged(), paths.intermediate_key_staged()] {
+            assert_ne!(gid, group);
+            assert_eq!(
+                mode_and_owner(&staged),
+                (OPERATOR_KEY_MODE, uid, group),
+                "{} (rooted: {rooted})",
+                staged.display()
+            );
+        }
+    }
+}
+
+/// A staged key the secrets owner replaced with a hard link to another
+/// file is refused under a rooted handle, with a message naming the
+/// staged key and its live counterpart, and the other file is left as
+/// it was.
+#[tokio::test]
+async fn rooted_phase2_refuses_a_hard_linked_staged_key() {
+    let mut rig = Rig::paused();
+    use_rooted_tree(&mut rig);
+    let messages = test_messages();
+    set_key_modes(&rig, OPERATOR_KEY_MODE);
+    let paths = &rig.ctx.paths;
+    let elsewhere = rig.dir.path().join("elsewhere");
+    fs::write(&elsewhere, &rig.new.root_key).expect("write elsewhere");
+    set_mode(&elsewhere, 0o600);
+    let staged = paths.root_key_staged();
+    fs::remove_file(&staged).expect("remove staged key");
+    fs::hard_link(&elsewhere, &staged).expect("hard-link staged key");
+    let mut state = rig.state(1);
+
+    let err = generate_staged_generation(&rig.ctx, &mut state, false, &messages)
+        .await
+        .expect_err("hard link refused");
+
+    let message = format!("{err:#}");
+    assert!(message.contains(&staged.display().to_string()), "{message}");
+    assert!(
+        message.contains(&paths.stepca_root_key().display().to_string()),
+        "{message}"
+    );
+    assert!(message.contains("links"), "{message}");
+    assert_eq!(mode_and_owner(&elsewhere).0, 0o600);
+}
+
+/// A kept staged key is given the live key's mode too, as a run that
+/// failed after writing it leaves it.
+#[tokio::test]
+async fn resumed_phase2_gives_a_kept_staged_key_the_live_keys_mode() {
+    let rig = Rig::paused();
+    let messages = test_messages();
+    let (uid, gid) = set_key_modes(&rig, OPERATOR_KEY_MODE);
+    let mut state = rig.state(1);
+
+    generate_staged_generation(&rig.ctx, &mut state, true, &messages)
+        .await
+        .expect("phase 2");
+
+    assert_eq!(decode_fake_docker_log(&rig.docker_log).len(), 0);
+    let paths = &rig.ctx.paths;
+    for staged in [paths.root_key_staged(), paths.intermediate_key_staged()] {
+        assert_eq!(mode_and_owner(&staged), (OPERATOR_KEY_MODE, uid, gid));
+    }
+}
+
+/// With the live keys at the default mode, Phase 2 changes nothing on
+/// the staged keys: not their mode, not their owner, and not their
+/// change time.
+#[tokio::test]
+async fn phase2_leaves_the_staged_keys_alone_at_the_default_mode() {
+    for rooted in [false, true] {
+        let mut rig = Rig::paused();
+        if rooted {
+            use_rooted_tree(&mut rig);
+        }
+        let messages = test_messages();
+        let (uid, gid) = set_key_modes(&rig, 0o600);
+        let paths = &rig.ctx.paths;
+        let staged_keys = [paths.root_key_staged(), paths.intermediate_key_staged()];
+        let before: Vec<_> = staged_keys
+            .iter()
+            .map(|staged| {
+                let meta = fs::metadata(staged).expect("stat");
+                (meta.ctime(), meta.ctime_nsec())
+            })
+            .collect();
+        let mut state = rig.state(1);
+
+        generate_staged_generation(&rig.ctx, &mut state, false, &messages)
+            .await
+            .expect("phase 2");
+
+        for (staged, changed) in staged_keys.iter().zip(before) {
+            assert_eq!(
+                mode_and_owner(staged),
+                (0o600, uid, gid),
+                "rooted: {rooted}"
+            );
+            let meta = fs::metadata(staged).expect("stat");
+            assert_eq!(
+                (meta.ctime(), meta.ctime_nsec()),
+                changed,
+                "{} was changed (rooted: {rooted})",
+                staged.display()
+            );
+        }
+    }
+}
+
+/// A live key that is absent leaves the staged key at the mode `step`
+/// created it with.
+#[tokio::test]
+async fn phase2_keeps_the_creation_mode_without_a_live_key() {
+    let rig = Rig::paused();
+    let messages = test_messages();
+    set_key_modes(&rig, OPERATOR_KEY_MODE);
+    let paths = &rig.ctx.paths;
+    fs::remove_file(paths.stepca_root_key()).expect("remove live root key");
+    fs::remove_file(paths.stepca_intermediate_key()).expect("remove live intermediate key");
+    let mut state = rig.state(1);
+
+    generate_staged_generation(&rig.ctx, &mut state, false, &messages)
+        .await
+        .expect("phase 2");
+
+    for staged in [paths.root_key_staged(), paths.intermediate_key_staged()] {
+        assert_eq!(mode_and_owner(&staged).0, 0o600);
+    }
+}
+
+/// An owner the run cannot give the staged key fails with a message
+/// naming the staged key and its live counterpart, and leaves the staged
+/// key where it is.
+#[test]
+fn an_owner_that_cannot_be_applied_names_the_staged_key() {
+    let rig = Rig::paused();
+    if own_owner(&rig).0 == 0 {
+        // Root may give any file any owner; nothing here can fail.
+        return;
+    }
+    let messages = test_messages();
+    let paths = &rig.ctx.paths;
+    let staged = paths.root_key_staged();
+    let live = paths.stepca_root_key();
+    let root_owned = FileMeta {
+        mode: OPERATOR_KEY_MODE,
+        uid: 0,
+        gid: 0,
+    };
+
+    let err = apply_live_key_meta(&rig.ctx.secrets, &staged, &live, root_owned, &messages)
+        .expect_err("chown to root without the privilege");
+
+    let message = format!("{err:#}");
+    assert!(message.contains(&staged.display().to_string()), "{message}");
+    assert!(message.contains(&live.display().to_string()), "{message}");
+    assert!(message.contains("uid=0 gid=0"), "{message}");
+    assert!(staged.exists(), "the staged key is left in place");
 }
 
 // ---------------------------------------------------------------------

@@ -23,7 +23,11 @@
 //! to a regular file the owner of `secrets/` hard-linked into the tree.
 //! While `fs.protected_hardlinks` is `1`, the default on current Linux
 //! distributions, that owner cannot link a file it neither owns nor can
-//! read and write.
+//! read and write. Nothing protects macOS and the BSDs that way, or a
+//! Linux host where it is `0`. So [`SecretsTree::set_file_meta`], which
+//! changes an owner as well as a mode, refuses in rooted mode a file
+//! with more than one link, or one that is not owned by the anchor's
+//! uid and gid, the owner who wrote it.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -1311,6 +1315,100 @@ impl SecretsTree {
         set_mode(&file, mode, path)
     }
 
+    /// Returns the mode and owner of the regular file at `path`, or
+    /// `None` when nothing is there.
+    ///
+    /// Path-based: `std::fs::metadata`, which follows a link. Rooted: the
+    /// file's directory is reached by the walk, the leaf is opened with
+    /// `O_NOFOLLOW` and read by `fstat`; a link at the leaf is an error.
+    ///
+    /// # Errors
+    /// Returns an error if `path` is not below the anchor or names a level
+    /// by anything but plain names, a directory level or the leaf cannot
+    /// be opened without following a link, the leaf cannot be stat'd, or
+    /// it is not a regular file.
+    pub fn file_meta(&self, path: &Path) -> std::io::Result<Option<FileMeta>> {
+        let names = self.relative_io(path)?;
+        let meta = if let Some(anchor_fd) = self.rooted_fd() {
+            let (leaf, _, dir) = match self.parent_of(anchor_fd, path, &names) {
+                Ok(found) => found,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(err) => return Err(err),
+            };
+            let file = match open_file_nofollow(&dir, leaf) {
+                Ok(file) => file,
+                Err(Errno::NOENT) => return Ok(None),
+                Err(err) => return Err(refused_file_io(err, path)),
+            };
+            file.metadata()
+        } else {
+            match std::fs::metadata(path) {
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                found => found,
+            }
+        }
+        .map_err(|err| io_context(&err, &format!("Failed to stat {}", path.display())))?;
+        require_regular(&meta, path)?;
+        Ok(Some(FileMeta {
+            mode: meta.mode() & 0o7777,
+            uid: meta.uid(),
+            gid: meta.gid(),
+        }))
+    }
+
+    /// Gives the regular file at `path` the mode and owner of `meta`,
+    /// changing only what differs.
+    ///
+    /// The owner is changed before the mode, so the new mode never
+    /// applies to the old owner or group. Path-based:
+    /// `std::os::unix::fs::chown` and `std::fs::set_permissions`, which
+    /// follow a link. Rooted: the file's directory is reached by the
+    /// walk, the file is opened with `O_NOFOLLOW`, confirmed regular by
+    /// `fstat`, and `fchown`ed and chmodded through its descriptor; a
+    /// link at the leaf is an error. Before it changes anything there,
+    /// the file must have a single link and be owned by the anchor's uid
+    /// and gid: a file the owner of `secrets/` wrote, not a hard link it
+    /// made to a file elsewhere.
+    ///
+    /// # Errors
+    /// Returns an error if `path` is not below the anchor or names a level
+    /// by anything but plain names, a directory level or the leaf cannot
+    /// be opened without following a link, the leaf is not a regular
+    /// file, a rooted handle finds it hard-linked or not owned by the
+    /// anchor's owner, or its owner or mode cannot be changed — the
+    /// owner, for one, without the privilege to `chown`.
+    pub fn set_file_meta(&self, path: &Path, meta: FileMeta) -> std::io::Result<()> {
+        let names = self.relative_io(path)?;
+        let stat_failed =
+            |err: std::io::Error| io_context(&err, &format!("Failed to stat {}", path.display()));
+        let Some(anchor_fd) = self.rooted_fd() else {
+            let current = std::fs::metadata(path).map_err(stat_failed)?;
+            return apply_file_meta(
+                &current,
+                meta,
+                path,
+                |uid, gid| std::os::unix::fs::chown(path, uid, gid),
+                |mode| std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)),
+            );
+        };
+        let (leaf, _, dir) = self.parent_of(anchor_fd, path, &names)?;
+        let file = open_file_nofollow(&dir, leaf).map_err(|err| refused_file_io(err, path))?;
+        let current = file.metadata().map_err(stat_failed)?;
+        if meta_differs(&current, meta) {
+            let anchor = rustix::fs::fstat(anchor_fd).map_err(|err| {
+                errno_context(err, &format!("Failed to stat {}", self.anchor.display()))
+            })?;
+            require_written_by(&current, (anchor.st_uid, anchor.st_gid), path)?;
+        }
+        apply_file_meta(
+            &current,
+            meta,
+            path,
+            |uid, gid| std::os::unix::fs::fchown(&file, uid, gid),
+            |mode| file.set_permissions(std::fs::Permissions::from_mode(mode)),
+        )
+    }
+
     /// Sets every directory below the anchor to `0700` and every regular
     /// file to `0600`, leaving owners and the anchor's own mode alone.
     ///
@@ -1809,6 +1907,104 @@ fn set_mode_io(file: &File, mode: u32, path: &Path) -> std::io::Result<()> {
                 &format!("Failed to set mode {mode:o} on {}", path.display()),
             )
         })
+}
+
+/// Refuses `meta` unless it is a regular file's, naming `path`.
+fn require_regular(meta: &std::fs::Metadata, path: &Path) -> std::io::Result<()> {
+    if meta.is_file() {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "Refusing to use {}: it is not a regular file",
+            path.display()
+        ),
+    ))
+}
+
+/// Whether the mode or owner of the file `current` describes differs
+/// from `meta`.
+fn meta_differs(current: &std::fs::Metadata, meta: FileMeta) -> bool {
+    current.mode() & 0o7777 != meta.mode || current.uid() != meta.uid || current.gid() != meta.gid
+}
+
+/// Refuses a file `current` describes unless it has a single link and
+/// is owned by `owner`, naming `path`: a rooted owner or mode change
+/// must not reach, through a hard link, a file the owner of `secrets/`
+/// did not write.
+fn require_written_by(
+    current: &std::fs::Metadata,
+    owner: (u32, u32),
+    path: &Path,
+) -> std::io::Result<()> {
+    if current.nlink() != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "Refusing to change the mode or owner of {}: it has {} links, so it may be a \
+                 hard link to a file outside the secrets directory",
+                path.display(),
+                current.nlink()
+            ),
+        ));
+    }
+    let found = (current.uid(), current.gid());
+    if found != owner {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "Refusing to change the mode or owner of {}: it is owned by uid={} gid={}, not \
+                 by the secrets directory's owner uid={} gid={} that wrote it",
+                path.display(),
+                found.0,
+                found.1,
+                owner.0,
+                owner.1
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Changes what differs between the regular file `current` describes
+/// and `meta`: its owner through `chown`, then its mode through
+/// `chmod`. The mode is set again after any owner change, which may
+/// have cleared a setuid or setgid bit. [`SecretsTree::set_file_meta`]
+/// passes the path or the descriptor calls.
+fn apply_file_meta(
+    current: &std::fs::Metadata,
+    meta: FileMeta,
+    path: &Path,
+    chown: impl FnOnce(Option<u32>, Option<u32>) -> std::io::Result<()>,
+    chmod: impl FnOnce(u32) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    require_regular(current, path)?;
+    let uid = (current.uid() != meta.uid).then_some(meta.uid);
+    let gid = (current.gid() != meta.gid).then_some(meta.gid);
+    let chowned = uid.is_some() || gid.is_some();
+    if chowned {
+        chown(uid, gid).map_err(|err| {
+            io_context(
+                &err,
+                &format!(
+                    "Failed to change the owner of {} to uid={} gid={}",
+                    path.display(),
+                    meta.uid,
+                    meta.gid
+                ),
+            )
+        })?;
+    }
+    if chowned || current.mode() & 0o7777 != meta.mode {
+        chmod(meta.mode).map_err(|err| {
+            io_context(
+                &err,
+                &format!("Failed to set mode {:o} on {}", meta.mode, path.display()),
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn dir_gid(dir: &File, path: &Path) -> std::io::Result<u32> {

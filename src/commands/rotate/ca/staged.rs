@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
 use anyhow::{Context, Result};
-use bootroot::fs_util::SecretsTree;
+use bootroot::fs_util::{FileMeta, SecretsTree};
 
 use super::super::{RotateContext, STEP_CA_HELPER_IMAGE, StatePaths};
 use super::{
@@ -162,10 +162,14 @@ pub(super) fn phase3_bundle_sources(paths: &StatePaths) -> Vec<PathBuf> {
 /// signed by it. A new rotation always generates, overwriting whatever an
 /// abandoned one left at the staging paths.
 ///
+/// Each staged key, generated or kept, is then given the mode and owner
+/// of its live counterpart, which the switch replaces with it.
+///
 /// # Errors
 ///
 /// Returns an error when a generation fails, a staged file cannot be
-/// read, or the staged intermediate is not signed by the staged root or
+/// read, a staged key cannot be given its live counterpart's mode and
+/// owner, or the staged intermediate is not signed by the staged root or
 /// is signed by the old one.
 pub(super) async fn generate_staged_generation(
     ctx: &RotateContext,
@@ -201,10 +205,79 @@ pub(super) async fn generate_staged_generation(
     if !keep_intermediate {
         generate_new_intermediate(ctx, &STAGED_CA_TARGETS, messages)?;
     }
+    // Only now, after Phase 2b's `step` has read the staged root key to
+    // sign the intermediate with it: that key keeps the mode and owner
+    // `step` gave it for as long as `step` still uses it.
+    for (staged, live) in [
+        (paths.root_key_staged(), paths.stepca_root_key()),
+        (
+            paths.intermediate_key_staged(),
+            paths.stepca_intermediate_key(),
+        ),
+    ] {
+        give_live_key_meta(ctx, staged, live, messages).await?;
+    }
     state.new_intermediate_fp =
         read_fingerprint(ctx, &paths.intermediate_cert_staged(), messages).await?;
 
     check_staged_chain(ctx, messages).await
+}
+
+/// Gives the staged key `staged` the mode and owner its live counterpart
+/// `live` has now, so the switch puts the new key in place as the
+/// operator left the old one. `step` creates the key with its own
+/// default mode, owned by the user it runs as. A live key that is absent
+/// leaves the staged key as `step` created it. A staged key that is
+/// absent is left to Phase 4, which refuses a live key that is not its
+/// certificate's.
+///
+/// A kept staged key goes through this too: the run that wrote it may
+/// have failed here.
+async fn give_live_key_meta(
+    ctx: &RotateContext,
+    staged: PathBuf,
+    live: PathBuf,
+    messages: &Messages,
+) -> Result<()> {
+    let messages = messages.clone();
+    ctx.secrets
+        .run(move |tree| {
+            if !present_in(tree, &staged)
+                .with_context(|| messages.error_read_file_failed(&staged.display().to_string()))?
+            {
+                return Ok(());
+            }
+            let Some(meta) = tree
+                .file_meta(&live)
+                .with_context(|| messages.error_read_file_failed(&live.display().to_string()))?
+            else {
+                return Ok(());
+            };
+            apply_live_key_meta(tree, &staged, &live, meta, &messages)
+        })
+        .await
+}
+
+/// Gives `staged` the mode and owner `meta` read from `live`. A failure,
+/// such as a `chown` without the privilege for it, names both files and
+/// leaves the staged key where it is, as any other failure in Phase 2
+/// leaves the staging paths. Blocking.
+fn apply_live_key_meta(
+    tree: &SecretsTree,
+    staged: &Path,
+    live: &Path,
+    meta: FileMeta,
+    messages: &Messages,
+) -> Result<()> {
+    tree.set_file_meta(staged, meta).with_context(|| {
+        messages.error_staged_key_meta_failed(
+            &staged.display().to_string(),
+            &live.display().to_string(),
+            &format!("{:04o}", meta.mode),
+            &meta.uid.to_string(),
+            &meta.gid.to_string(),
+        )
+    })
 }
 
 /// Holds the staged intermediate to the staged new root: signed by it,

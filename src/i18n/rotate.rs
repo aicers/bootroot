@@ -1085,6 +1085,26 @@ impl Messages {
         )
     }
 
+    pub(crate) fn error_staged_key_meta_failed(
+        &self,
+        staged: &str,
+        live: &str,
+        mode: &str,
+        uid: &str,
+        gid: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_staged_key_meta_failed,
+            &[
+                ("staged", staged),
+                ("live", live),
+                ("mode", mode),
+                ("uid", uid),
+                ("gid", gid),
+            ],
+        )
+    }
+
     pub(crate) fn error_postgres_cert_not_new_generation(
         &self,
         cert: &str,

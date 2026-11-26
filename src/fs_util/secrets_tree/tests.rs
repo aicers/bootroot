@@ -634,6 +634,231 @@ fn set_file_mode_sets_the_mode_of_a_regular_file() {
     }
 }
 
+/// A path-based and a rooted handle on `secrets`.
+fn both_handles(secrets: &Path) -> [(bool, SecretsTree); 2] {
+    [
+        (false, SecretsTree::open(secrets).expect("open")),
+        (
+            true,
+            SecretsTree::open_rooted_for_tests(secrets).expect("open rooted"),
+        ),
+    ]
+}
+
+/// A supplementary group of this process other than the gid of the
+/// files it creates in `dir`, confirmed by giving a probe file in `dir`
+/// that group; `None` when there is none.
+fn other_group(dir: &Path) -> Option<u32> {
+    let probe = dir.join("group-probe");
+    std::fs::write(&probe, "").expect("write probe");
+    let own = owner_of_path(&probe).1;
+    let output = std::process::Command::new("id")
+        .arg("-G")
+        .output()
+        .expect("run id -G");
+    let found = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .filter_map(|gid| gid.parse::<u32>().ok())
+        .filter(|gid| *gid != own)
+        .find(|gid| std::os::unix::fs::chown(&probe, None, Some(*gid)).is_ok());
+    std::fs::remove_file(&probe).expect("remove probe");
+    found
+}
+
+#[test]
+fn file_meta_reads_a_regular_file_and_nothing_where_there_is_none() {
+    let root = tempdir().expect("tempdir");
+    let secrets = secrets_in(root.path());
+    let file = secrets.join("server.key");
+    std::fs::write(&file, "key\n").expect("write");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+    let (uid, gid) = owner_of_path(&file);
+
+    for (rooted, tree) in both_handles(&secrets) {
+        assert_eq!(
+            tree.file_meta(&file).expect("file_meta"),
+            Some(FileMeta {
+                mode: 0o640,
+                uid,
+                gid
+            }),
+            "rooted={rooted}"
+        );
+        assert_eq!(
+            tree.file_meta(&secrets.join("absent.key"))
+                .expect("absent leaf"),
+            None,
+            "rooted={rooted}"
+        );
+        assert_eq!(
+            tree.file_meta(&secrets.join("absent").join("server.key"))
+                .expect("absent directory"),
+            None,
+            "rooted={rooted}"
+        );
+    }
+}
+
+#[test]
+fn file_meta_and_set_file_meta_refuse_a_non_regular_file() {
+    let root = tempdir().expect("tempdir");
+    let secrets = secrets_in(root.path());
+    let dir = secrets.join("tls");
+    std::fs::create_dir(&dir).expect("mkdir");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let (uid, gid) = owner_of_path(&dir);
+    let meta = FileMeta {
+        mode: 0o750,
+        uid,
+        gid,
+    };
+
+    for (rooted, tree) in both_handles(&secrets) {
+        let err = tree.file_meta(&dir).expect_err("file_meta of a directory");
+        assert!(
+            err.to_string().contains(&dir.display().to_string()),
+            "rooted={rooted}: {err}"
+        );
+        let err = tree
+            .set_file_meta(&dir, meta)
+            .expect_err("set_file_meta of a directory");
+        assert!(
+            err.to_string().contains(&dir.display().to_string()),
+            "rooted={rooted}: {err}"
+        );
+        assert_eq!(mode_of(&dir), 0o700, "rooted={rooted}");
+    }
+}
+
+#[test]
+fn rooted_file_meta_and_set_file_meta_refuse_a_symlinked_leaf() {
+    let root = tempdir().expect("tempdir");
+    let secrets = secrets_in(root.path());
+    let target = root.path().join("elsewhere.key");
+    std::fs::write(&target, "key\n").expect("write");
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let (uid, gid) = owner_of_path(&target);
+    let leaf = secrets.join("server.key");
+    symlink(&target, &leaf).expect("plant link");
+    let tree = SecretsTree::open_rooted_for_tests(&secrets).expect("open");
+
+    let err = tree.file_meta(&leaf).expect_err("file_meta refused");
+    assert!(
+        err.to_string().contains(&leaf.display().to_string()),
+        "{err}"
+    );
+    let err = tree
+        .set_file_meta(
+            &leaf,
+            FileMeta {
+                mode: 0o644,
+                uid,
+                gid,
+            },
+        )
+        .expect_err("set_file_meta refused");
+    assert!(
+        err.to_string().contains(&leaf.display().to_string()),
+        "{err}"
+    );
+    assert_eq!(mode_of(&target), 0o600);
+}
+
+#[test]
+fn rooted_set_file_meta_refuses_a_hard_linked_file() {
+    let root = tempdir().expect("tempdir");
+    let secrets = secrets_in(root.path());
+    let target = root.path().join("elsewhere.key");
+    std::fs::write(&target, "key\n").expect("write");
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let (uid, gid) = owner_of_path(&target);
+    let leaf = secrets.join("server.key");
+    std::fs::hard_link(&target, &leaf).expect("plant hard link");
+    let tree = SecretsTree::open_rooted_for_tests(&secrets).expect("open");
+
+    let err = tree
+        .set_file_meta(
+            &leaf,
+            FileMeta {
+                mode: 0o644,
+                uid,
+                gid,
+            },
+        )
+        .expect_err("refused");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    assert!(
+        err.to_string().contains(&leaf.display().to_string()),
+        "{err}"
+    );
+    assert_eq!(mode_of(&target), 0o600);
+}
+
+#[test]
+fn set_file_meta_gives_a_file_a_supplementary_group_and_its_mode() {
+    let root = tempdir().expect("tempdir");
+    let secrets = secrets_in(root.path());
+    let Some(group) = other_group(&secrets) else {
+        // No second group to change to: the owner change cannot be shown.
+        return;
+    };
+    for (rooted, tree) in both_handles(&secrets) {
+        let file = secrets.join(format!("server-{rooted}.key"));
+        std::fs::write(&file, "key\n").expect("write");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        let (uid, _) = owner_of_path(&file);
+
+        tree.set_file_meta(
+            &file,
+            FileMeta {
+                mode: 0o640,
+                uid,
+                gid: group,
+            },
+        )
+        .expect("set_file_meta");
+
+        assert_eq!(owner_of_path(&file), (uid, group), "rooted={rooted}");
+        assert_eq!(mode_of(&file), 0o640, "rooted={rooted}");
+    }
+}
+
+#[test]
+fn rooted_set_file_meta_refuses_a_file_the_anchor_owner_does_not_own() {
+    let root = tempdir().expect("tempdir");
+    let secrets = secrets_in(root.path());
+    let Some(group) = other_group(&secrets) else {
+        // No second group to give the file: it cannot differ from the anchor.
+        return;
+    };
+    let file = secrets.join("server.key");
+    std::fs::write(&file, "key\n").expect("write");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let (uid, gid) = owner_of_path(&file);
+    std::os::unix::fs::chown(&file, None, Some(group)).expect("chgrp");
+    let tree = SecretsTree::open_rooted_for_tests(&secrets).expect("open");
+
+    let err = tree
+        .set_file_meta(
+            &file,
+            FileMeta {
+                mode: 0o640,
+                uid,
+                gid,
+            },
+        )
+        .expect_err("refused");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    assert!(
+        err.to_string().contains(&file.display().to_string()),
+        "{err}"
+    );
+    assert_eq!(owner_of_path(&file), (uid, group));
+    assert_eq!(mode_of(&file), 0o600);
+}
+
 #[test]
 fn every_method_rejects_a_path_outside_the_anchor_or_holding_parent_components() {
     let root = tempdir().expect("tempdir");
