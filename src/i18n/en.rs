@@ -475,6 +475,7 @@ pub(super) static STRINGS: Strings = Strings {
     error_staged_chain_old_root: "{cert} is signed by the old root CA {root}, not by a new one",
     error_step_public_key_unreadable: "Could not read the public key of {key} from `step crypto key public`",
     error_staged_key_mismatch: "{key} is not the private key of {cert}",
+    error_staged_key_meta_failed: "Failed to give the staged key {staged} the mode {mode} and owner uid={uid} gid={gid} of the live key {live}. Fix the cause below and re-run the rotation",
     error_postgres_cert_not_new_generation: "The PostgreSQL TLS certificate {cert} is not issued by the new intermediate CA {intermediate}",
     error_stepca_switch_verification_failed: "The live CA files are not a complete new generation, so step-ca was not started and stays absent. Fix the cause and re-run `bootroot rotate ca-key --full`",
     error_stepca_restart_policy_unreadable: "Could not read the restart policy of the step-ca container {container}, so this run neither removed step-ca nor moved a staged file. Fix the cause and re-run `bootroot rotate ca-key --full`: {value}",
