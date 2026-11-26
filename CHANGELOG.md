@@ -4,6 +4,27 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0](https://github.com/aicers/bootroot/compare/0.8.4...0.9.0) - 2026-11-26
+
+### Added
+
+- feat: pause a full CA rotation before step-ca switches to the new root ([#1225](https://github.com/aicers/bootroot/pull/1225))
+
+### Fixed
+
+- fix: give staged CA keys the live keys' mode and owner ([#1227](https://github.com/aicers/bootroot/pull/1227))
+- fix(deps): update url to 2.5.9 for RUSTSEC-2026-0592 ([#1218](https://github.com/aicers/bootroot/pull/1218))
+
+### Other
+
+- refactor!: refuse a rotation-state.json without the staging fields ([#1229](https://github.com/aicers/bootroot/pull/1229))
+- test: remove anonymous volumes when tests remove containers ([#1224](https://github.com/aicers/bootroot/pull/1224))
+- ci: publish squash-merged release PRs ([#1220](https://github.com/aicers/bootroot/pull/1220))
+- chore: update shared instruction blocks to 0.6.4 ([#1216](https://github.com/aicers/bootroot/pull/1216))
+- chore: update shared instruction blocks to 0.6.3 ([#1215](https://github.com/aicers/bootroot/pull/1215))
+- ci: automate releases with release-plz ([#1211](https://github.com/aicers/bootroot/pull/1211))
+- Keep the release notes scratch file out of /tmp
+
 ## [0.8.4] - 2026-11-13
 
 ### Fixed
