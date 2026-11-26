@@ -2593,7 +2593,9 @@ Phase 3과 Phase 6도 해당 자격증명의 전용 trust 번들과 핀을 각�
      재로드합니다. step-ca는 `sslmode=verify-full`과 단일 실제 루트로
      PostgreSQL에 연결하므로, step-ca가 시작되기 전에 PostgreSQL이 새 세대
      인증서를 제시해야 합니다. 이 단계는 `step`을 오프라인으로 실행하며
-     step-ca가 필요하지 않습니다.
+     step-ca가 필요하지 않습니다. 다시 실행하면 디스크의 인증서가 이미 새
+     인증서여도 다시 발급하므로, 중단으로 끝내지 못한 키 넘겨주기나 재로드가
+     step-ca가 시작되기 전에 마무리됩니다.
   5. 실제 루트와 중간 인증서가 `rotation-state.json`에 기록된 새
      인증서인지, 각 실제 키가 자기 인증서의 키인지, PostgreSQL 인증서가 새
      중간 CA로 발급되었는지 확인합니다. 그런 다음에만
@@ -2609,6 +2611,10 @@ Phase 3과 Phase 6도 해당 자격증명의 전용 trust 번들과 핀을 각�
   Phase 5~7)는 다른 전체 회전과 같습니다. Phase 4의 각 단계는 반복해도
   안전하므로, Phase 4 도중 어디에서 중단되었든 `bootroot rotate ca-key
   --full`을 다시 실행하면 Phase 4와 회전을 마칩니다.
+  스테이징된 회전이 진행 중인 동안 `rotate ca-key`는 자신의 OpenBao 연결에
+  실제 경로, 스테이징 경로, 백업(`.bak`)의 CA 인증서를 모두 신뢰하므로,
+  마지막 이동 뒤에 다시 실행해도 이전 세대가 발급한 TLS 인증서를 쓰는
+  OpenBao 리스너에 연결할 수 있습니다.
 - Phase 4가 step-ca 컨테이너를 제거한 뒤 다시 시작하기 전에 중단되면,
   `bootroot rotate ca-key --full`을 다시 실행해 마칠 때까지 step-ca는 없는
   상태로 남고 인증서가 발급되지 않습니다.

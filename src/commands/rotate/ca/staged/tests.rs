@@ -1,6 +1,7 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fmt::Write as _;
 
+use bootroot::openbao::OpenBaoClient;
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, PublicKeyData};
 use tempfile::{TempDir, tempdir};
 
@@ -14,7 +15,9 @@ use super::super::{
     generate_intermediate_docker_args, generate_root_docker_args,
 };
 use super::*;
-use crate::commands::trust::{RotationMode, create_rotation_state, load_rotation_state};
+use crate::commands::trust::{
+    RotationMode, create_rotation_state, load_rotation_state, update_rotation_state,
+};
 use crate::state::{InfraCertEntry, ReloadStrategy, StateFile};
 
 const RESTART_POLICY: &str = "unless-stopped";
@@ -292,6 +295,9 @@ struct RecordingSwitch<'a> {
     reissue_with: Option<&'a Generation>,
     /// Answers the root key with another key's public half.
     wrong_root_key: bool,
+    /// Fails the next reissue after it has written the new leaf, as an
+    /// issuance whose key handover or reload then fails leaves it.
+    fail_after_issuance: Cell<bool>,
 }
 
 impl<'a> RecordingSwitch<'a> {
@@ -302,6 +308,7 @@ impl<'a> RecordingSwitch<'a> {
             policy: Some(RESTART_POLICY.to_string()),
             reissue_with: Some(&rig.new),
             wrong_root_key: false,
+            fail_after_issuance: Cell::new(false),
         }
     }
 
@@ -338,6 +345,9 @@ impl StepCaSwitch for RecordingSwitch<'_> {
         });
         if let Some(generation) = self.reissue_with {
             fs::write(self.rig.postgres_cert(), generation.sign_leaf())?;
+        }
+        if self.fail_after_issuance.replace(false) {
+            anyhow::bail!("postgres reload failed");
         }
         Ok(())
     }
@@ -1076,11 +1086,12 @@ async fn phase4_does_not_start_stepca_when_a_live_certificate_is_not_new() {
     assert!(!switch.started());
 }
 
-/// A resumed Phase 4 that finds every file moved but PostgreSQL still on
-/// the old generation reissues before step-ca starts; one that finds it
-/// already reissued leaves it alone.
+/// A resumed Phase 4 that finds every file moved reissues PostgreSQL's
+/// certificate before step-ca starts, whether the leaf on disk is still
+/// old or already new: a new leaf on disk does not show that its key was
+/// handed over or that PostgreSQL was reloaded onto it.
 #[tokio::test]
-async fn resumed_phase4_reissues_postgres_only_when_it_is_still_old() {
+async fn resumed_phase4_reissues_postgres_whether_or_not_the_leaf_is_new() {
     let messages = test_messages();
     for already_new in [false, true] {
         let rig = Rig::paused();
@@ -1108,13 +1119,72 @@ async fn resumed_phase4_reissues_postgres_only_when_it_is_still_old() {
         let start = events
             .iter()
             .position(|event| matches!(event, Event::Start(_)));
-        if already_new {
-            assert_eq!(reissue, None, "{events:?}");
-        } else {
-            assert!(reissue.is_some() && reissue < start, "{events:?}");
-        }
-        assert!(start.is_some());
+        assert!(
+            reissue.is_some() && start.is_some() && reissue < start,
+            "already_new={already_new}: {events:?}"
+        );
     }
+}
+
+/// A reissue that writes the new leaf and then fails — its key handover
+/// or `PostgreSQL`'s reload — leaves step-ca absent, and the next run,
+/// finding a new-generation leaf on disk, still reissues before it
+/// starts step-ca.
+#[tokio::test]
+async fn phase4_resumed_after_a_failure_past_issuance_reissues_before_starting_stepca() {
+    let rig = Rig::paused();
+    let old = Generation {
+        root_cert: rig.old.root_cert.clone(),
+        root_key: rig.old.root_key.clone(),
+        intermediate_cert: rig.old.intermediate_cert.clone(),
+        intermediate_key: rig.old.intermediate_key.clone(),
+    };
+    let rig = rig.with_postgres_signed_by(&old);
+    let messages = test_messages();
+    let switch = RecordingSwitch::new(&rig);
+    switch.fail_after_issuance.set(true);
+    let mut state = rig.recorded();
+
+    switch_to_staged_generation(&rig.ctx, &mut state, &switch, &messages)
+        .await
+        .expect_err("the reload after issuance fails");
+    assert!(!switch.started());
+    assert_eq!(rig.staged_present(), 0);
+    let leaf = cert_der_from_pem(
+        read_file(&rig.postgres_cert()).as_bytes(),
+        &rig.postgres_cert(),
+        &messages,
+    )
+    .expect("leaf");
+    let new_intermediate = cert_der_from_pem(
+        rig.new.intermediate_cert.as_bytes(),
+        Path::new("intermediate"),
+        &messages,
+    )
+    .expect("intermediate");
+    assert!(
+        cert_signed_by(&leaf, &new_intermediate).expect("verify"),
+        "the failed run left a new-generation leaf on disk"
+    );
+
+    let switch = RecordingSwitch::new(&rig);
+    let mut state = rig.recorded();
+    assert!(state.phase4_started);
+    switch_to_staged_generation(&rig.ctx, &mut state, &switch, &messages)
+        .await
+        .expect("resumed phase 4");
+
+    let events = switch.events();
+    let reissue = events
+        .iter()
+        .position(|event| matches!(event, Event::Reissue { .. }));
+    let start = events
+        .iter()
+        .position(|event| matches!(event, Event::Start(_)));
+    assert!(
+        reissue.is_some() && start.is_some() && reissue < start,
+        "{events:?}"
+    );
 }
 
 #[tokio::test]
@@ -1329,4 +1399,165 @@ fn public_key_pem_decodes_to_the_certificate_spki() {
     let der = public_key_der_from_pem(key.public_key_pem().as_bytes()).expect("decode");
     assert_eq!(der, key.subject_public_key_info());
     assert!(public_key_der_from_pem(key.serialize_pem().as_bytes()).is_err());
+}
+
+// ---------------------------------------------------------------------
+// The OpenBao connection a run continuing a staged rotation makes
+// ---------------------------------------------------------------------
+
+/// A leaf-only HTTPS server for `localhost` whose certificate
+/// `generation`'s intermediate signed, as `OpenBao`'s listener presents
+/// the certificate `step certificate create` wrote for it. Answers every
+/// request `200 OK`. Returns its port and the accept loop, to abort.
+async fn serve_https_signed_by(generation: &Generation) -> (u16, tokio::task::JoinHandle<()>) {
+    use std::sync::Arc;
+
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let issuer = Issuer::from_ca_cert_pem(
+        &generation.intermediate_cert,
+        KeyPair::from_pem(&generation.intermediate_key).expect("intermediate key"),
+    )
+    .expect("intermediate issuer");
+    let key = KeyPair::generate().expect("leaf key");
+    let cert = CertificateParams::new(vec!["localhost".to_string()])
+        .expect("leaf params")
+        .signed_by(&key, &issuer)
+        .expect("signed leaf");
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.der().clone()],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+        )
+        .expect("server TLS config");
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("local addr").port();
+    let server = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            // One connection at a time: a health check makes one request.
+            let Ok(mut tls) = acceptor.accept(stream).await else {
+                continue;
+            };
+            let mut buf = vec![0u8; 4096];
+            let _ = tls.read(&mut buf).await;
+            let _ = tls
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+            let _ = tls.shutdown().await;
+        }
+    });
+    (port, server)
+}
+
+fn ca_key_command() -> crate::cli::args::RotateCommand {
+    crate::cli::args::RotateCommand::CaKey(crate::cli::args::RotateCaKeyArgs {
+        full: true,
+        skip: Vec::new(),
+        force: false,
+        cleanup: false,
+        pause_before_step_ca: false,
+        registrar_socket_unit: None,
+    })
+}
+
+/// After Phase 4's last move the live certificates are the new
+/// generation while `OpenBao`'s listener still presents an old-generation
+/// leaf: trust from the live files alone refuses it, and the client a
+/// `rotate ca-key` run continuing the rotation builds still reaches it.
+/// The same holds while paused and after each earlier move.
+#[tokio::test]
+async fn ca_key_resume_reaches_openbao_serving_an_old_generation_leaf() {
+    let messages = test_messages();
+    for moves in 0..=4 {
+        let mut rig = Rig::paused();
+        rig.apply_moves(moves);
+        let (port, server) = serve_https_signed_by(&rig.old).await;
+        rig.ctx.openbao_url = format!("https://localhost:{port}");
+
+        if moves == 4 {
+            let live_only =
+                OpenBaoClient::with_local_trust(&rig.ctx.openbao_url, rig.ctx.paths.secrets_dir())
+                    .expect("live-trust client");
+            live_only
+                .health_check()
+                .await
+                .expect_err("the live files alone are the new generation");
+        }
+
+        let client =
+            super::super::super::rotate_openbao_client(&ca_key_command(), &rig.ctx, &messages)
+                .await
+                .expect("client");
+        client
+            .health_check()
+            .await
+            .unwrap_or_else(|err| panic!("after {moves} moves: {err:#}"));
+        server.abort();
+    }
+}
+
+/// An interruption in Phase 7 after `--cleanup` removed the backups and
+/// before the state was deleted still leaves a client to resume with,
+/// trusting the generation now live.
+#[tokio::test]
+async fn ca_key_resume_trust_skips_backups_cleanup_removed() {
+    let messages = test_messages();
+    let mut rig = Rig::paused();
+    rig.apply_moves(4);
+    for backup in [
+        rig.ctx.paths.root_cert_bak(),
+        rig.ctx.paths.root_key_bak(),
+        rig.ctx.paths.intermediate_cert_bak(),
+        rig.ctx.paths.intermediate_key_bak(),
+    ] {
+        fs::remove_file(backup).expect("remove backup");
+    }
+    let (port, server) = serve_https_signed_by(&rig.new).await;
+    rig.ctx.openbao_url = format!("https://localhost:{port}");
+
+    let client = super::super::super::rotate_openbao_client(&ca_key_command(), &rig.ctx, &messages)
+        .await
+        .expect("client");
+    client
+        .health_check()
+        .await
+        .expect("new-generation listener");
+    server.abort();
+}
+
+/// Only a staged full rotation widens the trust; with no rotation, or an
+/// unstaged one, the live certificates alone are it.
+#[tokio::test]
+async fn openbao_recovery_trust_applies_only_to_a_staged_rotation() {
+    let messages = test_messages();
+    let rig = Rig::paused();
+    assert!(
+        super::super::staged_rotation_openbao_trust(&rig.ctx, &messages)
+            .await
+            .expect("trust")
+            .is_some()
+    );
+
+    let mut unstaged = rig.state(3);
+    unstaged.staged = false;
+    update_rotation_state(&rig.ctx.state_dir, &unstaged, &messages).expect("state");
+    assert!(
+        super::super::staged_rotation_openbao_trust(&rig.ctx, &messages)
+            .await
+            .expect("trust")
+            .is_none()
+    );
+
+    crate::commands::trust::delete_rotation_state(&rig.ctx.state_dir, &messages).expect("delete");
+    assert!(
+        super::super::staged_rotation_openbao_trust(&rig.ctx, &messages)
+            .await
+            .expect("trust")
+            .is_none()
+    );
 }

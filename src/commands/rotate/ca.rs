@@ -895,6 +895,32 @@ fn surface_wait_budget() -> WaitBudget {
     }
 }
 
+/// The CA bundle a `rotate ca-key` run builds its own `OpenBao`
+/// connection on while a staged full rotation is in progress, or `None`
+/// when none is and the live certificates alone are the trust.
+///
+/// See [`staged::openbao_recovery_trust`]: once Phase 4 has moved the
+/// new generation into place, an `OpenBao` listener certificate issued
+/// under the old one still has to verify for the run to finish.
+///
+/// # Errors
+///
+/// Returns an error when the rotation state or a present CA file cannot
+/// be read.
+pub(super) async fn staged_rotation_openbao_trust(
+    ctx: &RotateContext,
+    messages: &Messages,
+) -> Result<Option<String>> {
+    match load_rotation_state(&ctx.state_dir, messages)? {
+        Some(state) if state.staged && state.mode == RotationMode::Full => {
+            staged::openbao_recovery_trust(ctx, messages)
+                .await
+                .map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
 /// The additive PEM bundle a repair republishes mid-rotation.
 ///
 /// Exactly the sources Phase 3 concatenated, so a recovery run and the

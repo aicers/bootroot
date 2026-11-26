@@ -326,8 +326,7 @@ async fn run_rotate_with_exec(
         }
         _ => None,
     };
-    let mut client = OpenBaoClient::with_local_trust(&ctx.openbao_url, ctx.paths.secrets_dir())
-        .with_context(|| messages.error_openbao_client_create_failed())?;
+    let mut client = rotate_openbao_client(&args.command, &ctx, messages).await?;
     match (&if_due_plan, &runtime_auth) {
         (Some(plan), RuntimeAuthResolved::AppRole { role_id, secret_id }) => {
             if_due::log_in(
@@ -429,6 +428,31 @@ async fn run_rotate_with_exec(
 /// run unlocked.
 fn held_state_lock(state_lock: Option<&StateLock>) -> Result<&StateLock> {
     state_lock.context("this rotate subcommand saves state.json but took no state lock")
+}
+
+/// The `OpenBao` client a rotation authenticates and runs with.
+///
+/// It trusts the live CA certificates, as every operator command does,
+/// except for `rotate ca-key` over HTTPS while a staged full rotation is
+/// in progress: from Phase 4's last move the live certificates are the
+/// new generation while the listener's certificate may still be the old
+/// one, so that run also trusts the generations the rotation recorded
+/// ([`ca::staged_rotation_openbao_trust`]).
+async fn rotate_openbao_client(
+    command: &RotateCommand,
+    ctx: &RotateContext,
+    messages: &Messages,
+) -> Result<OpenBaoClient> {
+    if matches!(command, RotateCommand::CaKey(_))
+        && ctx.openbao_url.starts_with("https://")
+        && let Some(pem) = ca::staged_rotation_openbao_trust(ctx, messages).await?
+    {
+        let client = bootroot::tls::build_http_client_with_local_and_webpki_roots(&pem)
+            .with_context(|| messages.error_openbao_client_create_failed())?;
+        return Ok(OpenBaoClient::with_client(&ctx.openbao_url, client));
+    }
+    OpenBaoClient::with_local_trust(&ctx.openbao_url, ctx.paths.secrets_dir())
+        .with_context(|| messages.error_openbao_client_create_failed())
 }
 
 /// Test harness for the `rotate` commands that shell out to `docker`.

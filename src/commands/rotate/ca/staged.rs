@@ -514,9 +514,12 @@ pub(super) fn staged_moves(paths: &StatePaths, state: &RotationState) -> [Staged
 ///    always` after a host or daemon restart — runs it on a mixed
 ///    generation.
 /// 3. Moves the four staged files into place ([`staged_moves`]).
-/// 4. Issues `PostgreSQL`'s TLS certificate under the new intermediate
-///    unless the one on disk already is, as step-ca's `verify-full`
-///    connection checks it against the single live root.
+/// 4. Issues `PostgreSQL`'s TLS certificate under the new intermediate,
+///    hands its key over and reloads the server, as step-ca's
+///    `verify-full` connection checks it against the single live root.
+///    A resume does this again even when the certificate on disk is
+///    already new, since an interruption after issuance can leave the
+///    handover or the reload undone.
 /// 5. Verifies the live generation and `PostgreSQL`'s certificate, and
 ///    only then starts step-ca with the recorded restart policy.
 ///
@@ -571,9 +574,12 @@ pub(super) async fn switch_to_staged_generation(
         println!("{line}");
     }
 
-    if let Some(cert) = postgres_cert_path(ctx)
-        && !issued_by_live_intermediate(ctx, &cert, messages).await
-    {
+    // Every run, not only while the leaf on disk is still old: issuance
+    // writes the new leaf before the key handover and the reload, so a
+    // leaf already issued by the new intermediate does not show that
+    // PostgreSQL has its key or serves that leaf. Issuing again repeats
+    // all three, and step-ca starts only after they have all succeeded.
+    if postgres_cert_path(ctx).is_some() {
         println!(
             "{}",
             messages.rotate_ca_key_postgres_reissue_new_generation()
@@ -587,6 +593,57 @@ pub(super) async fn switch_to_staged_generation(
 
     println!("{}", messages.rotate_ca_key_stepca_starting());
     ops.start_stepca(state.stepca_restart_policy.as_deref())
+}
+
+/// The CA certificates a run continuing a staged rotation trusts for its
+/// own `OpenBao` connection, as one PEM bundle: the live root and
+/// intermediate, each staged one still there, and the Phase-1 backups.
+///
+/// After Phase 4's last move both live certificates are the new
+/// generation, while an `OpenBao` listener certificate this CA issued is
+/// still the old one, so trust built from the live files alone would
+/// refuse the connection the resume needs and leave step-ca absent. The
+/// backups hold the old generation throughout. Absent files are skipped:
+/// staged files are gone once moved, and `--cleanup` removes the
+/// backups in Phase 7 just before the rotation state.
+///
+/// # Errors
+///
+/// Returns an error when a present file cannot be read.
+pub(super) async fn openbao_recovery_trust(
+    ctx: &RotateContext,
+    messages: &Messages,
+) -> Result<String> {
+    let paths = &ctx.paths;
+    let candidates = [
+        paths.root_cert(),
+        paths.intermediate_cert(),
+        paths.root_cert_staged(),
+        paths.intermediate_cert_staged(),
+        paths.root_cert_bak(),
+        paths.intermediate_cert_bak(),
+    ];
+    let messages = messages.clone();
+    ctx.secrets
+        .run(move |tree| {
+            let mut bundle = String::new();
+            for path in &candidates {
+                let display = path.display().to_string();
+                if !present_in(tree, path)
+                    .with_context(|| messages.error_read_file_failed(&display))?
+                {
+                    continue;
+                }
+                let contents = read_in(tree, path)
+                    .with_context(|| messages.error_read_file_failed(&display))?;
+                bundle.push_str(&String::from_utf8_lossy(&contents));
+                if !bundle.ends_with('\n') {
+                    bundle.push('\n');
+                }
+            }
+            Ok(bundle)
+        })
+        .await
 }
 
 /// Moves one staged file into place by a rename within its directory and

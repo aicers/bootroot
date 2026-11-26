@@ -2713,7 +2713,10 @@ error and changes nothing.
      PostgreSQL with `SIGHUP`. step-ca connects to PostgreSQL with
      `sslmode=verify-full` against the single live root, so PostgreSQL
      has to present a new-generation certificate before step-ca starts.
-     This runs `step` offline and does not need step-ca;
+     This runs `step` offline and does not need step-ca. A re-run issues
+     it again even when the certificate on disk is already the new one,
+     so a key handover or reload an interruption left undone is finished
+     before step-ca starts;
   5. verifies that the live root and intermediate certificates are the
      new ones `rotation-state.json` records, that each live key belongs
      to its certificate, and that the PostgreSQL certificate is issued by
@@ -2730,6 +2733,10 @@ error and changes nothing.
   host, and Phases 5 to 7 — runs as in any full rotation. Each step of
   Phase 4 is safe to repeat, so re-running `bootroot rotate ca-key --full`
   after an interruption anywhere in it finishes Phase 4 and the rotation.
+  While a staged rotation is in progress, `rotate ca-key` trusts the live,
+  staged and backed-up (`.bak`) CA certificates for its own OpenBao
+  connection, so a re-run after the last move still reaches an OpenBao
+  listener whose TLS certificate the old generation issued.
 - If Phase 4 is interrupted between removing the step-ca container and
   starting it again, step-ca stays absent, and no certificates are
   issued, until `bootroot rotate ca-key --full` is run again to finish.
