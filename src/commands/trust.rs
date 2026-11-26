@@ -45,14 +45,13 @@ pub(crate) struct RotationState {
     pub(crate) phase: u8,
     /// Whether this full rotation builds the new generation at staging
     /// paths (`--pause-before-step-ca`) and moves it into place only in
-    /// Phase 4. Absent from a state file an older build wrote, which
-    /// reads as `false`: that rotation resumes exactly as before.
-    #[serde(default)]
+    /// Phase 4. Required: every state file this build writes carries
+    /// it, and one without it is refused as corrupt.
     pub(crate) staged: bool,
     /// Whether Phase 4 of a staged rotation has begun changing anything:
     /// written before step-ca is removed, so an interrupted Phase 4 is
-    /// told apart from a rotation paused after Phase 3.
-    #[serde(default)]
+    /// told apart from a rotation paused after Phase 3. Required, as
+    /// `staged` is.
     pub(crate) phase4_started: bool,
     /// The restart policy step-ca's container carried when a staged
     /// Phase 4 removed it, applied again to the container it recreates.
@@ -315,17 +314,67 @@ mod tests {
         }
     }
 
-    /// A state file written before staging existed carries neither
-    /// field; both read as `false`, so that rotation resumes unstaged.
+    /// Writes a full rotation's state at Phase 3 with every field this
+    /// build writes, minus `omit`.
+    fn write_state_without(dir: &Path, omit: &str) {
+        let mut state = serde_json::json!({
+            "mode": "full",
+            "started_at": "2026-03-01T10:00:00Z",
+            "old_root_fp": "aaa",
+            "new_root_fp": "ccc",
+            "old_intermediate_fp": "bbb",
+            "new_intermediate_fp": "ddd",
+            "phase": 3,
+            "staged": true,
+            "phase4_started": false,
+            "stepca_restart_policy": "unless-stopped"
+        });
+        state
+            .as_object_mut()
+            .expect("state is an object")
+            .remove(omit)
+            .expect("field to omit is present");
+        fs::write(
+            rotation_state_path(dir),
+            serde_json::to_string_pretty(&state).expect("serialize state"),
+        )
+        .expect("write state");
+    }
+
+    /// A state file without a staging field is refused through the
+    /// corrupt-state error, which names the field, rather than read as
+    /// an unstaged rotation.
     #[test]
-    fn load_rotation_state_without_staging_fields_reads_them_as_false() {
+    fn load_rotation_state_without_a_staging_field_is_refused() {
+        for field in ["staged", "phase4_started"] {
+            let dir = tempdir().expect("tempdir");
+            let messages = test_messages();
+            write_state_without(dir.path(), field);
+
+            let err = load_rotation_state(dir.path(), &messages)
+                .expect_err("a state file without a staging field must be refused");
+
+            let path = rotation_state_path(dir.path());
+            assert_eq!(
+                err.to_string(),
+                messages.error_rotation_state_corrupt(&path.display().to_string()),
+                "{field}"
+            );
+            let chain = format!("{err:#}");
+            assert!(
+                chain.contains(&format!("missing field `{field}`")),
+                "{field}: {chain}"
+            );
+        }
+    }
+
+    /// `stepca_restart_policy` is genuinely optional: this build writes
+    /// a state file without it whenever it is `None`.
+    #[test]
+    fn load_rotation_state_without_restart_policy_reads_none() {
         let dir = tempdir().expect("tempdir");
         let messages = test_messages();
-        fs::write(
-            rotation_state_path(dir.path()),
-            r#"{"mode":"full","started_at":"2026-03-01T10:00:00Z","old_root_fp":"aaa","new_root_fp":"ccc","old_intermediate_fp":"bbb","new_intermediate_fp":"ddd","phase":3}"#,
-        )
-        .expect("write legacy state");
+        write_state_without(dir.path(), "stepca_restart_policy");
 
         let loaded = load_rotation_state(dir.path(), &messages)
             .expect("load")
@@ -333,7 +382,7 @@ mod tests {
 
         assert_eq!(loaded.mode, RotationMode::Full);
         assert_eq!(loaded.phase, 3);
-        assert!(!loaded.staged);
+        assert!(loaded.staged);
         assert!(!loaded.phase4_started);
         assert_eq!(loaded.stepca_restart_policy, None);
     }
@@ -375,6 +424,39 @@ mod tests {
         assert_eq!(loaded.mode, RotationMode::IntermediateOnly);
         assert_eq!(loaded.phase, 0);
         assert_eq!(loaded.old_root_fp, "aaa");
+    }
+
+    /// Both writers put the staging fields in the file even when they
+    /// are `false`, so a file this build writes is never one
+    /// `load_rotation_state` refuses for lacking them.
+    #[test]
+    fn rotation_state_writers_always_write_the_staging_fields() {
+        let dir = tempdir().expect("tempdir");
+        let messages = test_messages();
+        let mut state = sample_state();
+        let read_raw = || -> serde_json::Value {
+            let text = fs::read_to_string(rotation_state_path(dir.path())).expect("read state");
+            serde_json::from_str(&text).expect("parse state")
+        };
+
+        create_rotation_state(dir.path(), &state, &messages).expect("create");
+        let created = read_raw();
+        assert_eq!(created["staged"], serde_json::json!(false), "{created}");
+        assert_eq!(
+            created["phase4_started"],
+            serde_json::json!(false),
+            "{created}"
+        );
+
+        state.phase = 1;
+        update_rotation_state(dir.path(), &state, &messages).expect("update");
+        let updated = read_raw();
+        assert_eq!(updated["staged"], serde_json::json!(false), "{updated}");
+        assert_eq!(
+            updated["phase4_started"],
+            serde_json::json!(false),
+            "{updated}"
+        );
     }
 
     #[test]

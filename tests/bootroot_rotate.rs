@@ -3034,7 +3034,9 @@ async fn test_rotate_ca_key_resumes_from_phase() {
             "new_root_fp": "aaa",
             "old_intermediate_fp": "bbb",
             "new_intermediate_fp": "ccc",
-            "phase": 6
+            "phase": 6,
+            "staged": false,
+            "phase4_started": false
         }))
         .unwrap(),
     )
@@ -3098,7 +3100,9 @@ async fn test_rotate_ca_key_finalize_blocks_unmigrated() {
             "new_root_fp": "aaa",
             "old_intermediate_fp": "bbb",
             "new_intermediate_fp": "ccc",
-            "phase": 5
+            "phase": 5,
+            "staged": false,
+            "phase4_started": false
         }))
         .unwrap(),
     )
@@ -3687,7 +3691,9 @@ async fn test_rotate_ca_key_cleanup_deletes_backups() {
             "new_root_fp": "aaa",
             "old_intermediate_fp": "bbb",
             "new_intermediate_fp": "ccc",
-            "phase": 6
+            "phase": 6,
+            "staged": false,
+            "phase4_started": false
         }))
         .unwrap(),
     )
@@ -3769,7 +3775,9 @@ async fn test_rotate_ca_key_skip_reissue_skips_phase_5() {
             "new_root_fp": "aaa",
             "old_intermediate_fp": "bbb",
             "new_intermediate_fp": "ccc",
-            "phase": 4
+            "phase": 4,
+            "staged": false,
+            "phase4_started": false
         }))
         .unwrap(),
     )
@@ -3859,7 +3867,9 @@ async fn test_rotate_ca_key_force_finalize_with_unmigrated() {
             "new_root_fp": "aaa",
             "old_intermediate_fp": "bbb",
             "new_intermediate_fp": "ccc",
-            "phase": 5
+            "phase": 5,
+            "staged": false,
+            "phase4_started": false
         }))
         .unwrap(),
     )
@@ -4062,7 +4072,9 @@ async fn test_rotate_ca_key_full_mode_4_fingerprints() {
             "new_root_fp": "new-root-bbb",
             "old_intermediate_fp": "old-inter-ccc",
             "new_intermediate_fp": "new-inter-ddd",
-            "phase": 2
+            "phase": 2,
+            "staged": false,
+            "phase4_started": false
         }))
         .unwrap(),
     )
@@ -4154,7 +4166,9 @@ async fn test_rotate_ca_key_mode_mismatch_bails() {
             "new_root_fp": "aaa",
             "old_intermediate_fp": "bbb",
             "new_intermediate_fp": "ccc",
-            "phase": 3
+            "phase": 3,
+            "staged": false,
+            "phase4_started": false
         }))
         .unwrap(),
     )
@@ -4226,7 +4240,9 @@ async fn test_rotate_ca_key_full_force_finalize_enhanced_warning() {
             "new_root_fp": "new-root",
             "old_intermediate_fp": "old-inter",
             "new_intermediate_fp": "new-inter",
-            "phase": 5
+            "phase": 5,
+            "staged": false,
+            "phase4_started": false
         }))
         .unwrap(),
     )
@@ -4474,7 +4490,9 @@ async fn test_rotate_ca_key_full_mode_cleanup_deletes_root_backups() {
             "new_root_fp": "new-root",
             "old_intermediate_fp": "old-inter",
             "new_intermediate_fp": "new-inter",
-            "phase": 6
+            "phase": 6,
+            "staged": false,
+            "phase4_started": false
         }))
         .unwrap(),
     )
@@ -4555,7 +4573,9 @@ async fn test_rotate_ca_key_reverse_mode_mismatch_bails() {
             "new_root_fp": "new-root",
             "old_intermediate_fp": "old-inter",
             "new_intermediate_fp": "new-inter",
-            "phase": 3
+            "phase": 3,
+            "staged": false,
+            "phase4_started": false
         }))
         .unwrap(),
     )
@@ -4614,7 +4634,9 @@ async fn test_rotate_ca_key_full_mode_resumes_from_phase() {
             "new_root_fp": "new-root",
             "old_intermediate_fp": "old-inter",
             "new_intermediate_fp": "new-inter",
-            "phase": 6
+            "phase": 6,
+            "staged": false,
+            "phase4_started": false
         }))
         .unwrap(),
     )
@@ -4719,7 +4741,9 @@ fn write_rotation_state_at_phase(root: &Path, phase: u8) {
             "new_root_fp": "aaa",
             "old_intermediate_fp": "bbb",
             "new_intermediate_fp": "ccc",
-            "phase": phase
+            "phase": phase,
+            "staged": false,
+            "phase4_started": false
         }))
         .expect("serialize rotation-state.json"),
     )
@@ -9849,19 +9873,17 @@ async fn test_rotate_ca_key_pause_before_step_ca_refuses_unpausable_rotations() 
         let openbao = MockServer::start().await;
         stub_openbao_for_ca_key_rotation(&openbao).await;
         let fixture = stage_staged_rotation(root, &openbao.uri());
-        let mut state = json!({
+        let state = json!({
             "mode": "full",
             "started_at": "2026-11-26T00:00:00Z",
             "old_root_fp": "aaa",
             "new_root_fp": "bbb",
             "old_intermediate_fp": "ccc",
             "new_intermediate_fp": "ddd",
-            "phase": phase
+            "phase": phase,
+            "staged": staged,
+            "phase4_started": staged
         });
-        if staged {
-            state["staged"] = json!(true);
-            state["phase4_started"] = json!(true);
-        }
         let state_text = serde_json::to_string_pretty(&state).expect("serialize");
         fs::write(root.join("rotation-state.json"), &state_text).expect("write state");
         let live_before = live_ca_files(root);
