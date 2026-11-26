@@ -4060,6 +4060,48 @@ interval. For a `remote-bootstrap` host whose `secret_id` expired while
 its agent was offline, see
 [Recovering a remote host whose `secret_id` expired](#recovering-a-remote-host-whose-secret_id-expired).
 
+## Pausing a full CA rotation for Clumit Endpoint
+
+Clumit Endpoint endpoints trust bootroot's root CA only through the signed
+address documents aice-web-next distributes. A full rotation
+(`bootroot rotate ca-key --full`) therefore has to stop before step-ca
+starts issuing under the new root, until enough endpoints have adopted
+it. `--pause-before-step-ca` is that stop: the new generation is built at
+staging paths, step-ca keeps issuing under the current root — even if it
+restarts — and the rotation continues only when it is run again without
+the flag. [CLI > rotate ca-key](cli.md#pausing-before-step-ca-switches)
+describes the staging paths, the pause output and Phase 4 in full.
+
+Rotate the root in this order:
+
+1. Run `bootroot rotate ca-key --full --pause-before-step-ca`. It stops
+   after Phase 3 and prints the staged new root certificate's path, its
+   SHA-256 fingerprint and its PEM.
+2. Paste the printed new root PEM into aice-web-next's root rotation
+   screen, and confirm the fingerprint aice-web-next shows matches the
+   one bootroot printed.
+3. Let aice-web-next distribute address documents carrying both roots,
+   and watch the adoption ratio there until enough endpoints have
+   adopted the new root.
+4. Run `bootroot rotate ca-key --full` to continue. Endpoints that have
+   not adopted the new root by then lose their connection once step-ca
+   issues under it, and must be reinstalled.
+5. After the rotation completes, remove the old root in aice-web-next.
+
+Phase 4 of the continuing run removes the step-ca container before it
+moves the staged files into place, and starts it again only after it has
+verified the new generation. If that run is interrupted in between,
+step-ca stays absent — nothing is issued — until
+`bootroot rotate ca-key --full` is run again to finish. Running
+`docker compose up` or `bootroot infra up` on the bootroot stack in that
+window recreates step-ca (it is a default service of the stack, and
+`prometheus`, under the `lan` and `public` profiles, has
+`depends_on: step-ca`). The order of the moves keeps such a step-ca from
+issuing under a mixed generation: until the last move it either issues
+under the old generation or fails to start or to produce verifiable
+certificates, and it can issue under the new generation only once every
+file is in place.
+
 ## Force reissue
 
 To delete a service's certificate and key and trigger bootroot-agent to

@@ -942,6 +942,10 @@ pub(crate) enum RotateSkipPhase {
     Finalize,
 }
 
+// Each boolean is an independent command-line switch an operator gives
+// or omits; clap's flags are bools, and folding them into an enum would
+// only rebuild the argument list by hand.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Args, Debug)]
 pub(crate) struct RotateCaKeyArgs {
     /// Rotate both root and intermediate CA keys (full rotation)
@@ -956,6 +960,19 @@ pub(crate) struct RotateCaKeyArgs {
     /// Delete backup files on completion
     #[arg(long)]
     pub(crate) cleanup: bool,
+    /// Build the new root and intermediate at staging paths and stop
+    /// after Phase 3, before step-ca is switched to the new root.
+    ///
+    /// Until the rotation is continued with `bootroot rotate ca-key
+    /// --full` (without this flag), step-ca keeps issuing under the
+    /// current root, even across a restart. Requires `--full`; cannot be
+    /// combined with `--skip`, `--force` or `--cleanup`.
+    #[arg(
+        long,
+        requires = "full",
+        conflicts_with_all = ["skip", "force", "cleanup"]
+    )]
+    pub(crate) pause_before_step_ca: bool,
     /// Socket unit to read the registrar endpoint's `ListenStream=` from,
     /// exactly as `bootroot registrar capabilities --socket-unit` does.
     ///
@@ -2010,6 +2027,82 @@ mod tests {
                 _ => panic!("expected CaKey subcommand"),
             },
             _ => panic!("expected Rotate command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_rotate_ca_key_pause_before_step_ca_with_full() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "rotate",
+            "ca-key",
+            "--full",
+            "--pause-before-step-ca",
+        ]);
+        match cli.command {
+            CliCommand::Rotate(args) => match args.command {
+                RotateCommand::CaKey(ca) => {
+                    assert!(ca.full);
+                    assert!(ca.pause_before_step_ca);
+                }
+                _ => panic!("expected CaKey subcommand"),
+            },
+            _ => panic!("expected Rotate command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_rotate_ca_key_defaults_to_no_pause() {
+        let cli = Cli::parse_from(["bootroot", "rotate", "ca-key", "--full"]);
+        match cli.command {
+            CliCommand::Rotate(args) => match args.command {
+                RotateCommand::CaKey(ca) => assert!(!ca.pause_before_step_ca),
+                _ => panic!("expected CaKey subcommand"),
+            },
+            _ => panic!("expected Rotate command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_rejects_pause_before_step_ca_without_full() {
+        let err = Cli::try_parse_from(["bootroot", "rotate", "ca-key", "--pause-before-step-ca"])
+            .expect_err("the pause flag requires --full");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "{err}"
+        );
+        assert!(err.to_string().contains("--full"), "{err}");
+    }
+
+    #[test]
+    fn test_cli_rejects_pause_before_step_ca_with_conflicting_flags() {
+        for (flag, extra) in [
+            ("--skip", Some("reissue")),
+            ("--force", None),
+            ("--cleanup", None),
+        ] {
+            let mut argv = vec![
+                "bootroot",
+                "rotate",
+                "ca-key",
+                "--full",
+                "--pause-before-step-ca",
+                flag,
+            ];
+            argv.extend(extra);
+            let err =
+                Cli::try_parse_from(&argv).expect_err("the pause flag must refuse the combination");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{flag}: {err}"
+            );
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains("--pause-before-step-ca") && rendered.contains(flag),
+                "the error must name both flags: {rendered}"
+            );
         }
     }
 

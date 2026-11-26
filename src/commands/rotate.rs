@@ -65,6 +65,13 @@ pub(crate) const REGISTRAR_CLIENT_RETIRED_DIR: &str = "registrar-client-retired"
 /// The staging name [`REGISTRAR_CLIENT_RETIRED_DIR`] is written under
 /// before it is renamed into place.
 pub(crate) const REGISTRAR_CLIENT_RETIRED_STAGING_DIR: &str = "registrar-client-retired.staging";
+/// Appended to the name of each live CA file to give the path a staged
+/// full rotation (`--pause-before-step-ca`) builds its counterpart at,
+/// in the same directory, so Phase 4 moves it into place by a rename.
+///
+/// step-ca's `ca.json` names the live files only, so nothing it reads
+/// ends in this suffix.
+pub(super) const STAGED_CA_FILE_SUFFIX: &str = ".staged";
 pub(super) const OPENBAO_RECOVERY_SCOPE_UNSEAL_KEYS: &str = "unseal-keys";
 pub(super) const OPENBAO_RECOVERY_SCOPE_ROOT_TOKEN: &str = "root-token";
 pub(super) const OPENBAO_ROOT_ROTATION_INCOMPLETE_ERROR: &str =
@@ -150,6 +157,22 @@ impl StatePaths {
             .join("intermediate_ca_key.bak")
     }
 
+    pub(super) fn root_cert_staged(&self) -> PathBuf {
+        staged_path(&self.root_cert())
+    }
+
+    pub(super) fn root_key_staged(&self) -> PathBuf {
+        staged_path(&self.stepca_root_key())
+    }
+
+    pub(super) fn intermediate_cert_staged(&self) -> PathBuf {
+        staged_path(&self.intermediate_cert())
+    }
+
+    pub(super) fn intermediate_key_staged(&self) -> PathBuf {
+        staged_path(&self.stepca_intermediate_key())
+    }
+
     pub(super) fn registrar_client_retired(&self) -> PathBuf {
         self.secrets_dir.join(REGISTRAR_CLIENT_RETIRED_DIR)
     }
@@ -157,6 +180,16 @@ impl StatePaths {
     pub(super) fn registrar_client_retired_staging(&self) -> PathBuf {
         self.secrets_dir.join(REGISTRAR_CLIENT_RETIRED_STAGING_DIR)
     }
+}
+
+/// The staging path of the live CA file `live`: the same directory, the
+/// name followed by [`STAGED_CA_FILE_SUFFIX`].
+fn staged_path(live: &Path) -> PathBuf {
+    let mut name = live
+        .file_name()
+        .map_or_else(std::ffi::OsString::new, std::ffi::OsStr::to_os_string);
+    name.push(STAGED_CA_FILE_SUFFIX);
+    live.with_file_name(name)
 }
 
 #[derive(Debug)]
@@ -293,8 +326,7 @@ async fn run_rotate_with_exec(
         }
         _ => None,
     };
-    let mut client = OpenBaoClient::with_local_trust(&ctx.openbao_url, ctx.paths.secrets_dir())
-        .with_context(|| messages.error_openbao_client_create_failed())?;
+    let mut client = rotate_openbao_client(&args.command, &ctx, messages).await?;
     match (&if_due_plan, &runtime_auth) {
         (Some(plan), RuntimeAuthResolved::AppRole { role_id, secret_id }) => {
             if_due::log_in(
@@ -396,6 +428,31 @@ async fn run_rotate_with_exec(
 /// run unlocked.
 fn held_state_lock(state_lock: Option<&StateLock>) -> Result<&StateLock> {
     state_lock.context("this rotate subcommand saves state.json but took no state lock")
+}
+
+/// The `OpenBao` client a rotation authenticates and runs with.
+///
+/// It trusts the live CA certificates, as every operator command does,
+/// except for `rotate ca-key` over HTTPS while a staged full rotation is
+/// in progress: from Phase 4's last move the live certificates are the
+/// new generation while the listener's certificate may still be the old
+/// one, so that run also trusts the generations the rotation recorded
+/// ([`ca::staged_rotation_openbao_trust`]).
+async fn rotate_openbao_client(
+    command: &RotateCommand,
+    ctx: &RotateContext,
+    messages: &Messages,
+) -> Result<OpenBaoClient> {
+    if matches!(command, RotateCommand::CaKey(_))
+        && ctx.openbao_url.starts_with("https://")
+        && let Some(pem) = ca::staged_rotation_openbao_trust(ctx, messages).await?
+    {
+        let client = bootroot::tls::build_http_client_with_local_and_webpki_roots(&pem)
+            .with_context(|| messages.error_openbao_client_create_failed())?;
+        return Ok(OpenBaoClient::with_client(&ctx.openbao_url, client));
+    }
+    OpenBaoClient::with_local_trust(&ctx.openbao_url, ctx.paths.secrets_dir())
+        .with_context(|| messages.error_openbao_client_create_failed())
 }
 
 /// Test harness for the `rotate` commands that shell out to `docker`.
