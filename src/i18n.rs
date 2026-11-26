@@ -492,6 +492,7 @@ pub(crate) struct Strings {
     pub(crate) error_staged_key_mismatch: &'static str,
     pub(crate) error_postgres_cert_not_new_generation: &'static str,
     pub(crate) error_stepca_switch_verification_failed: &'static str,
+    pub(crate) error_stepca_restart_policy_unreadable: &'static str,
     pub(crate) rotate_ca_key_phase_switch_stepca: &'static str,
     pub(crate) rotate_ca_key_stepca_removing: &'static str,
     pub(crate) rotate_ca_key_staged_moved: &'static str,

@@ -477,6 +477,7 @@ pub(super) static STRINGS: Strings = Strings {
     error_staged_key_mismatch: "{key} is not the private key of {cert}",
     error_postgres_cert_not_new_generation: "The PostgreSQL TLS certificate {cert} is not issued by the new intermediate CA {intermediate}",
     error_stepca_switch_verification_failed: "The live CA files are not a complete new generation, so step-ca was not started and stays absent. Fix the cause and re-run `bootroot rotate ca-key --full`",
+    error_stepca_restart_policy_unreadable: "Could not read the restart policy of the step-ca container {container}, so this run neither removed step-ca nor moved a staged file. Fix the cause and re-run `bootroot rotate ca-key --full`: {value}",
     rotate_ca_key_phase_switch_stepca: "[Phase 4] Switching step-ca to the staged new generation...",
     rotate_ca_key_stepca_removing: "Stopping and removing the step-ca container before the staged files are moved into place",
     rotate_ca_key_staged_moved: "Moved {staged} to {live}",

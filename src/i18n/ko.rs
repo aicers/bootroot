@@ -477,6 +477,7 @@ pub(super) static STRINGS: Strings = Strings {
     error_staged_key_mismatch: "{key}은(는) {cert}의 개인 키가 아닙니다",
     error_postgres_cert_not_new_generation: "PostgreSQL TLS 인증서 {cert}이(가) 새 중간 CA {intermediate}로 발급되지 않았습니다",
     error_stepca_switch_verification_failed: "실제 CA 파일이 완전한 새 세대가 아니므로 step-ca를 시작하지 않았으며 step-ca는 없는 상태로 남습니다. 원인을 해결한 뒤 `bootroot rotate ca-key --full`을 다시 실행하세요",
+    error_stepca_restart_policy_unreadable: "step-ca 컨테이너 {container}의 재시작 정책을 읽을 수 없어 이번 실행은 step-ca를 제거하지 않았고 스테이징된 파일도 옮기지 않았습니다. 원인을 해결한 뒤 `bootroot rotate ca-key --full`을 다시 실행하세요: {value}",
     rotate_ca_key_phase_switch_stepca: "[4단계] step-ca를 스테이징된 새 세대로 전환 중...",
     rotate_ca_key_stepca_removing: "스테이징된 파일을 옮기기 전에 step-ca 컨테이너를 중지하고 제거합니다",
     rotate_ca_key_staged_moved: "{staged}을(를) {live}(으)로 옮겼습니다",

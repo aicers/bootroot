@@ -7,7 +7,6 @@ use tempfile::{TempDir, tempdir};
 
 use super::super::super::test_support::{
     decode_fake_docker_log, path_tree, test_messages, write_self_contained_fake_docker,
-    write_self_contained_fake_docker_exiting,
 };
 use super::super::super::{INTERMEDIATE_CA_COMMON_NAME, ROOT_CA_COMMON_NAME};
 use super::super::{
@@ -1304,17 +1303,28 @@ fn docker_switch_refuses_a_recorded_bind_without_its_override_before_anything() 
     assert_eq!(decode_fake_docker_log(&rig.docker_log).len(), 0);
 }
 
-#[test]
-fn docker_switch_reads_the_restart_policy_of_the_running_container() {
-    let rig = Rig::paused();
-    let messages = test_messages();
-    let mut ctx_docker = rig.dir.path().join("inspect-docker");
-    crate::test_support::write_executable(
-        &ctx_docker,
-        format!("#!/bin/sh\necho {RESTART_POLICY}\n").as_bytes(),
+/// A fake `docker` beside the rig's log that logs every invocation as
+/// the self-contained fake does, and fails `inspect` with `stderr`;
+/// every other command succeeds.
+fn write_inspect_failing_docker(path: &Path, stderr: &str) {
+    assert!(
+        !stderr.contains('\''),
+        "stderr is a single-quoted shell word"
     );
-    let ctx = RotateContext {
-        docker: ctx_docker.clone(),
+    crate::test_support::write_executable(
+        path,
+        format!(
+            "#!/bin/sh\nset -eu\nprintf '%s\\0' \"$#\" \"$@\" >> \"$(dirname \"$0\")/docker.log\"\n\
+             if [ \"$1\" = inspect ]; then printf '%s\\n' '{stderr}' >&2; exit 1; fi\nexit 0\n"
+        )
+        .as_bytes(),
+    );
+}
+
+/// The rig's context with `docker` in place of its fake.
+fn ctx_with_docker(rig: &Rig, docker: PathBuf) -> RotateContext {
+    RotateContext {
+        docker,
         openbao_url: String::new(),
         kv_mount: rig.ctx.kv_mount.clone(),
         compose_file: rig.ctx.compose_file.clone(),
@@ -1323,21 +1333,109 @@ fn docker_switch_reads_the_restart_policy_of_the_running_container() {
         state_dir: rig.ctx.state_dir.clone(),
         state_file: rig.ctx.state_file.clone(),
         secrets: path_tree(rig.ctx.paths.secrets_dir()),
-    };
+    }
+}
+
+const DAEMON_ERROR: &str = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?";
+
+#[test]
+fn docker_switch_reads_the_restart_policy_of_the_running_container() {
+    let rig = Rig::paused();
+    let messages = test_messages();
+    let docker = rig.dir.path().join("inspect-docker");
+    crate::test_support::write_executable(
+        &docker,
+        format!("#!/bin/sh\necho {RESTART_POLICY}\n").as_bytes(),
+    );
+    let ctx = ctx_with_docker(&rig, docker);
     let switch = DockerStepCaSwitch::prepare(&ctx, &messages).expect("prepare");
     assert_eq!(
         switch.current_restart_policy().expect("inspect").as_deref(),
         Some(RESTART_POLICY)
     );
+}
 
-    ctx_docker = rig.dir.path().join("missing-docker");
-    write_self_contained_fake_docker_exiting(&ctx_docker, &rig.docker_log, 1);
-    let ctx = RotateContext {
-        docker: ctx_docker,
-        ..ctx
-    };
+/// Only Docker's own report that the container does not exist reads as
+/// "no policy", in each spelling Docker releases have used.
+#[test]
+fn docker_switch_reads_no_policy_only_when_the_container_is_absent() {
+    let rig = Rig::paused();
+    let messages = test_messages();
+    for stderr in [
+        "Error: No such container: insight-bootroot-ca",
+        "Error response from daemon: No such container: insight-bootroot-ca",
+        "Error: No such object: insight-bootroot-ca",
+        "error: no such object: insight-bootroot-ca",
+    ] {
+        let docker = rig.dir.path().join("absent-docker");
+        write_inspect_failing_docker(&docker, stderr);
+        let ctx = ctx_with_docker(&rig, docker);
+        let switch = DockerStepCaSwitch::prepare(&ctx, &messages).expect("prepare");
+        assert_eq!(
+            switch.current_restart_policy().expect(stderr),
+            None,
+            "{stderr}"
+        );
+    }
+}
+
+/// Any other inspect failure is an error naming the container and what
+/// Docker said, not an absent container.
+#[test]
+fn docker_switch_refuses_an_inspect_failure_that_is_not_absence() {
+    let rig = Rig::paused();
+    let messages = test_messages();
+    for stderr in [DAEMON_ERROR, ""] {
+        let docker = rig.dir.path().join("failing-docker");
+        write_inspect_failing_docker(&docker, stderr);
+        let ctx = ctx_with_docker(&rig, docker);
+        let switch = DockerStepCaSwitch::prepare(&ctx, &messages).expect("prepare");
+        let err = switch
+            .current_restart_policy()
+            .expect_err("an inspect failure is not absence")
+            .to_string();
+        assert!(err.contains(&switch.container()), "{err}");
+        assert!(err.contains(stderr), "{err}");
+    }
+}
+
+/// An inspect that fails while the container exists stops Phase 4
+/// before anything changes: `phase4_started` stays unrecorded, step-ca
+/// is neither removed nor recreated, and every staged file is still in
+/// place, so a re-run reads the policy again.
+#[tokio::test]
+async fn phase4_changes_nothing_when_the_restart_policy_cannot_be_read() {
+    let rig = Rig::paused();
+    let messages = test_messages();
+    let docker = rig.dir.path().join("failing-docker");
+    write_inspect_failing_docker(&docker, DAEMON_ERROR);
+    let ctx = ctx_with_docker(&rig, docker);
     let switch = DockerStepCaSwitch::prepare(&ctx, &messages).expect("prepare");
-    assert_eq!(switch.current_restart_policy().expect("inspect"), None);
+    let mut state = rig.recorded();
+
+    let err = switch_to_staged_generation(&ctx, &mut state, &switch, &messages)
+        .await
+        .expect_err("an unreadable policy stops Phase 4");
+
+    assert!(err.to_string().contains(DAEMON_ERROR), "{err}");
+    let invocations = decode_fake_docker_log(&rig.docker_log);
+    assert_eq!(
+        invocations.len(),
+        1,
+        "only the inspect ran: {invocations:?}"
+    );
+    assert_eq!(
+        invocations
+            .first()
+            .and_then(|args| args.first())
+            .map(String::as_str),
+        Some("inspect")
+    );
+    let recorded = rig.recorded();
+    assert!(!recorded.phase4_started);
+    assert_eq!(recorded.stepca_restart_policy, None);
+    assert_eq!(rig.staged_present(), 4);
+    assert_live_is(&rig, &rig.old);
 }
 
 /// The restart policy read back from `docker inspect` is the value

@@ -2580,7 +2580,10 @@ Phase 3과 Phase 6도 해당 자격증명의 전용 trust 번들과 핀을 각�
 - 옵션 없이 `bootroot rotate ca-key --full`을 실행하면 회전을 이어서
   진행합니다. 스테이징된 회전의 Phase 4는 다음과 같습니다:
   1. Phase 4가 시작되었다는 사실을 step-ca 컨테이너의 재시작 정책과 함께
-     `rotation-state.json`에 기록합니다.
+     `rotation-state.json`에 기록합니다. 컨테이너가 없는 경우가 아닌 다른
+     이유(예: Docker 데몬에 연결할 수 없음)로 `docker inspect`가 실패하면
+     아무것도 기록하거나 제거하기 전에 오류로 종료하므로, 읽기에 실패해서
+     재시작 정책을 잃는 일은 없습니다.
   2. step-ca 컨테이너를 중지하고 제거합니다
      (`docker compose rm -sf step-ca`). 중지만 한 컨테이너는
      `restart: always` 때문에 호스트나 Docker 데몬이 재시작되면 다시

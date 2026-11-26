@@ -235,7 +235,13 @@ async fn check_staged_chain(ctx: &RotateContext, messages: &Messages) -> Result<
 /// without a Docker daemon.
 pub(super) trait StepCaSwitch {
     /// Returns the restart policy step-ca's container carries now, or
-    /// `None` when there is no such container.
+    /// `None` when Docker confirms there is no such container.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the container cannot be inspected for any
+    /// other reason, so Phase 4 stops before it removes the only
+    /// container carrying the policy.
     fn current_restart_policy(&self) -> Result<Option<String>>;
     /// Stops and removes step-ca's container. Succeeds when there is
     /// none.
@@ -310,12 +316,25 @@ impl StepCaSwitch for DockerStepCaSwitch<'_> {
         let container = self.container();
         let output = self.docker_output(&[
             "inspect",
+            "--type",
+            "container",
             "--format",
             "{{.HostConfig.RestartPolicy.Name}} {{.HostConfig.RestartPolicy.MaximumRetryCount}}",
             &container,
         ])?;
         if !output.status.success() {
-            return Ok(None);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Only a confirmed absence reads as "no policy": a daemon or
+            // API failure while the container still exists would
+            // otherwise let Phase 4 remove it and recreate step-ca on
+            // the compose default.
+            if inspect_reports_no_such_container(&stderr) {
+                return Ok(None);
+            }
+            anyhow::bail!(
+                self.messages
+                    .error_stepca_restart_policy_unreadable(&container, stderr.trim())
+            );
         }
         Ok(restart_policy_from_inspect(&String::from_utf8_lossy(
             &output.stdout,
@@ -389,6 +408,15 @@ impl StepCaSwitch for DockerStepCaSwitch<'_> {
         }
         Ok(())
     }
+}
+
+/// Returns whether `docker inspect --type container` failed because the
+/// container does not exist, as opposed to any other failure. Docker
+/// reports that as `No such container: <name>`, and older clients as
+/// `No such object: <name>`; the case varies between releases.
+fn inspect_reports_no_such_container(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    stderr.contains("no such container") || stderr.contains("no such object")
 }
 
 /// Turns the `<name> <maximum retry count>` that `docker inspect` prints

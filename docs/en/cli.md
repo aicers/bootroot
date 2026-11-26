@@ -2700,7 +2700,11 @@ error and changes nothing.
 - `bootroot rotate ca-key --full`, without the flag, continues the
   rotation. Phase 4 of a staged rotation:
   1. records in `rotation-state.json` that Phase 4 has started, together
-     with the step-ca container's restart policy;
+     with the step-ca container's restart policy. When `docker inspect`
+     fails for any reason other than the container being absent (an
+     unreachable Docker daemon, for example), the command exits with an
+     error before recording or removing anything, so the policy is never
+     lost to a failed read;
   2. stops and removes the step-ca container
      (`docker compose rm -sf step-ca`). A merely stopped container would
      come back on a host or Docker daemon restart through

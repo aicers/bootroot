@@ -1100,6 +1100,17 @@ impl Messages {
         self.strings().error_stepca_switch_verification_failed
     }
 
+    pub(crate) fn error_stepca_restart_policy_unreadable(
+        &self,
+        container: &str,
+        stderr: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_stepca_restart_policy_unreadable,
+            &[("container", container), ("value", stderr)],
+        )
+    }
+
     pub(crate) fn rotate_ca_key_phase_switch_stepca(&self) -> &'static str {
         self.strings().rotate_ca_key_phase_switch_stepca
     }
